@@ -67,6 +67,11 @@ describe("SQLite Durable Object", () => {
     expect(
       (await f.post("pair-start", await signed({ ...start, expires: Date.now() - 1 }))).status,
     ).toBe(400);
+    const clockAhead = { ...start, id: crypto.randomUUID(), expires: Date.now() + 650_000 };
+    expect((await f.post("pair-start", await signed(clockAhead))).status).toBe(200);
+    const invalidSignature = await f.post("pair-start", { ...start, signature: "invalid" });
+    expect(invalidSignature.status).toBe(400);
+    expect((await invalidSignature.json()).error.code).toBe("PAIR_REQUEST_SIGNATURE_INVALID");
     expect((await f.post("pair-start", await signed(start))).status).toBe(200);
     expect((await f.auth("pair-deny", { id: start.id })).status).toBe(200);
     expect((await f.auth("pair-deny", { id: start.id })).status).toBe(400);

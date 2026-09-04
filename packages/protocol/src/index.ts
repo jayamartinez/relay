@@ -83,9 +83,12 @@ export interface Challenge {
   device: string;
   purpose: string;
   nonce: string;
+  issued: number;
   expires: number;
   digest: string;
 }
+export const CHALLENGE_LIFETIME_MS = 30_000;
+export const CLOCK_SKEW_MS = 120_000;
 export interface Proof {
   challenge: Challenge;
   signature: string;

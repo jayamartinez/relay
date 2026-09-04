@@ -2,7 +2,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { checkControl, hash, verify } from "@relay/crypto";
 import {
+  CHALLENGE_LIFETIME_MS,
   type Challenge,
+  CLOCK_SKEW_MS,
   type Control,
   type Envelope,
   type OperationRow,
@@ -31,12 +33,13 @@ class HttpError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly code = "REQUEST_VALIDATION_FAILED",
   ) {
     super(message);
   }
 }
-function fail(status: number, message: string): never {
-  throw new HttpError(status, message);
+function fail(status: number, message: string, code?: string): never {
+  throw new HttpError(status, message, code);
 }
 const json = (value: unknown, status = 200) =>
   Response.json(value, {
@@ -249,7 +252,12 @@ export class RelayAccount extends DurableObject<Env> {
         return await this.dispatch(account, action, payload, input.proof);
       } catch (error) {
         return json(
-          { error: error instanceof HttpError ? error.message : "Request validation failed." },
+          {
+            error:
+              error instanceof HttpError
+                ? { code: error.code, message: error.message }
+                : { code: "REQUEST_VALIDATION_FAILED", message: "Request validation failed." },
+          },
           error instanceof HttpError ? error.status : 400,
         );
       }
@@ -301,7 +309,8 @@ export class RelayAccount extends DurableObject<Env> {
         device,
         purpose,
         nonce: crypto.randomUUID(),
-        expires: Date.now() + 30_000,
+        issued: Date.now(),
+        expires: Date.now() + CHALLENGE_LIFETIME_MS,
         digest: text(p.digest, 64),
       };
       this.temporary(`challenge:${challenge.nonce}`, challenge, challenge.expires);
@@ -317,30 +326,43 @@ export class RelayAccount extends DurableObject<Env> {
       this.meta();
       if (this.pending().filter((r) => r.status === "pending").length >= LIMITS.pending)
         fail(429, "Too many pending requests.");
-      const start: PairStart = {
-        id: id(p.id),
-        device: parseDevice(p.device),
-        commitment: text(p.commitment, 64),
-        expires: integer(p.expires),
-      };
-      assert(
-        start.expires > Date.now() &&
-          start.expires <= Date.now() + 600_000 &&
-          start.device.id !== "recovery",
-      );
-      assert(
-        !this.readTemporary(`pair:${start.id}`) &&
-          !this.meta().control.members.some((d) => d.id === start.device.id),
-      );
-      const signature = text(p.signature, 256);
-      assert(
-        await verify(
-          start.device.auth,
-          { version: 1, account, type: "pair-start", ...start },
-          signature,
-        ),
-      );
-      this.savePair({ ...start, status: "pending" });
+      let start: PairStart;
+      let signature: string;
+      try {
+        start = {
+          id: id(p.id),
+          device: parseDevice(p.device),
+          commitment: text(p.commitment, 64),
+          expires: integer(p.expires),
+        };
+        signature = text(p.signature, 256);
+      } catch {
+        fail(400, "Relay could not validate this device request.", "PAIR_REQUEST_SCHEMA_INVALID");
+      }
+      if (
+        start!.expires <= Date.now() ||
+        start!.expires > Date.now() + 600_000 + CLOCK_SKEW_MS ||
+        start!.device.id === "recovery"
+      )
+        fail(
+          400,
+          "The request timestamp is invalid. Check your system clock.",
+          "PAIR_REQUEST_TIMESTAMP_INVALID",
+        );
+      if (
+        this.readTemporary(`pair:${start!.id}`) ||
+        this.meta().control.members.some((d) => d.id === start!.device.id)
+      )
+        fail(400, "This device request already exists.", "PAIR_REQUEST_ALREADY_EXISTS");
+      if (
+        !(await verify(
+          start!.device.auth,
+          { version: 1, account, type: "pair-start", ...start! },
+          signature!,
+        ))
+      )
+        fail(400, "Relay could not verify this device request.", "PAIR_REQUEST_SIGNATURE_INVALID");
+      this.savePair({ ...start!, status: "pending" });
       return json({ ok: true });
     }
     if (action === "pair-read" || action === "pair-reveal") {

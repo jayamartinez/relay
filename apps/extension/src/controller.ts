@@ -48,7 +48,15 @@ import {
   sameDevice,
   type Workspace,
 } from "@relay/protocol";
-import { assert, canonical, canonicalAccount, LIMITS, serverOrigin, text } from "@relay/shared";
+import {
+  assert,
+  canonical,
+  canonicalAccount,
+  LIMITS,
+  record,
+  serverOrigin,
+  text,
+} from "@relay/shared";
 import { Api, ApiError } from "./api";
 import {
   browserWindows,
@@ -414,7 +422,15 @@ export class Controller {
     return this.status();
   }
   async join(server: string, account: string, name: string) {
-    const s = await this.newLocal(account, server, name);
+    const normalizedServer = serverOrigin(server, __DEV__);
+    const normalizedAccount = canonicalAccount(account);
+    const s = this.local ?? (await this.newLocal(normalizedAccount, normalizedServer, name));
+    assert(
+      s.phase === "draft" && s.account === normalizedAccount && s.server === normalizedServer,
+      "Cancel the current Relay setup before using a different account or server.",
+    );
+    this.halted = false;
+    this.error = "";
     const pair = await ephemeral();
     const request: PairStart = {
       id: crypto.randomUUID(),
@@ -422,12 +438,7 @@ export class Controller {
       commitment: pair.commitment,
       expires: Date.now() + 590_000,
     };
-    s.request = { ...request, status: "pending" };
-    s.pairSecrets[request.id] = { reveal: pair.reveal, commitment: pair.commitment };
-    await vault.write(`ephemeral:${request.id}`, pair.privateKey);
-    s.phase = "pending";
-    await this.persist();
-    await this.api().post("pair-start", {
+    const response = await this.api().post<unknown>("pair-start", {
       ...request,
       signature: await sign(this.key(), {
         version: 1,
@@ -436,6 +447,14 @@ export class Controller {
         ...request,
       }),
     });
+    assert(record(response).ok === true, "Relay did not create the device request.");
+    // Only a confirmed, persisted request may enter the polling state. A failed
+    // pair-start stays on the request screen and cannot produce false expirations.
+    s.pairSecrets[request.id] = { reveal: pair.reveal, commitment: pair.commitment };
+    await vault.write(`ephemeral:${request.id}`, pair.privateKey);
+    s.request = { ...request, status: "pending" };
+    s.phase = "pending";
+    await this.persist();
     return this.status();
   }
   private transcript(pair: PairRequest): PairTranscript {
@@ -591,10 +610,8 @@ export class Controller {
       s.account === canonicalAccount(account) && s.server === serverOrigin(server, __DEV__),
       "Recovery must use this account and server.",
     );
-    if (s.phase === "draft" && !s.recoveryDisplay) {
-      s.phase = "pending";
-      await this.persist();
-    }
+    this.halted = false;
+    this.error = "";
     const info = await this.api().post<{ recovery: Recovery; chain: Control[] }>(
       "recover-info",
       {},

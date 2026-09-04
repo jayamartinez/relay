@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { hash, sign } from "@relay/crypto";
-import type { Challenge } from "@relay/protocol";
-import { assert, canonical, LIMITS, record } from "@relay/shared";
+import { CHALLENGE_LIFETIME_MS, type Challenge, CLOCK_SKEW_MS } from "@relay/protocol";
+import { assert, canonical, id, integer, LIMITS, record, text } from "@relay/shared";
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -9,6 +9,61 @@ export class ApiError extends Error {
   ) {
     super(message);
   }
+}
+export type ChallengeValidationFailure =
+  | "SCHEMA_INVALID"
+  | "PROTOCOL_VERSION_MISMATCH"
+  | "ACCOUNT_HANDLE_MISMATCH"
+  | "DEVICE_MISMATCH"
+  | "PURPOSE_MISMATCH"
+  | "DIGEST_MISMATCH"
+  | "NONCE_INVALID"
+  | "TIMESTAMP_INVALID"
+  | "EXPIRED"
+  | "ISSUED_IN_FUTURE";
+export class ChallengeValidationError extends Error {
+  constructor(readonly code: ChallengeValidationFailure) {
+    super(`Invalid server challenge (${code}).`);
+  }
+}
+export function validateChallenge(
+  raw: unknown,
+  expected: Pick<Challenge, "account" | "device" | "purpose" | "digest">,
+  now = Date.now(),
+): Challenge {
+  let challenge: Challenge;
+  try {
+    const value = record(raw);
+    challenge = {
+      version: value.version as 1,
+      account: text(value.account, 64),
+      device: id(value.device),
+      purpose: text(value.purpose, 40),
+      nonce: id(value.nonce),
+      issued: integer(value.issued),
+      expires: integer(value.expires),
+      digest: text(value.digest, 64),
+    };
+  } catch {
+    throw new ChallengeValidationError("SCHEMA_INVALID");
+  }
+  if (challenge.version !== 1) throw new ChallengeValidationError("PROTOCOL_VERSION_MISMATCH");
+  if (challenge.account !== expected.account)
+    throw new ChallengeValidationError("ACCOUNT_HANDLE_MISMATCH");
+  if (challenge.device !== expected.device) throw new ChallengeValidationError("DEVICE_MISMATCH");
+  if (challenge.purpose !== expected.purpose)
+    throw new ChallengeValidationError("PURPOSE_MISMATCH");
+  if (challenge.digest !== expected.digest) throw new ChallengeValidationError("DIGEST_MISMATCH");
+  if (!challenge.nonce) throw new ChallengeValidationError("NONCE_INVALID");
+  if (
+    challenge.expires <= challenge.issued ||
+    challenge.expires - challenge.issued > CHALLENGE_LIFETIME_MS
+  )
+    throw new ChallengeValidationError("TIMESTAMP_INVALID");
+  if (challenge.issued > now + CLOCK_SKEW_MS)
+    throw new ChallengeValidationError("ISSUED_IN_FUTURE");
+  if (challenge.expires <= now - CLOCK_SKEW_MS) throw new ChallengeValidationError("EXPIRED");
+  return challenge;
 }
 export class Api {
   constructor(
@@ -56,7 +111,11 @@ export class Api {
       const error = record(parsed).error;
       throw new ApiError(
         response.status,
-        typeof error === "string" ? error : "Server request failed.",
+        typeof error === "string"
+          ? error
+          : error && typeof error === "object" && typeof record(error).message === "string"
+            ? (record(error).message as string)
+            : "Server request failed.",
       );
     }
     return parsed as T;
@@ -69,16 +128,7 @@ export class Api {
   ): Promise<T> {
     const digest = await hash(canonical(payload));
     const challenge = await this.post<Challenge>("challenge", { device, purpose: action, digest });
-    assert(
-      challenge.version === 1 &&
-        challenge.account === this.account &&
-        challenge.device === device &&
-        challenge.purpose === action &&
-        challenge.digest === digest &&
-        challenge.expires > Date.now() &&
-        challenge.expires <= Date.now() + 60_000,
-      "Invalid server challenge.",
-    );
+    validateChallenge(challenge, { account: this.account, device, purpose: action, digest });
     return this.post(action, payload, { challenge, signature: await sign(key, challenge) });
   }
 }

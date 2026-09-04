@@ -1,10 +1,10 @@
 # Relay protocol v1
 
-All routes are beneath `/v1/{64-character-account-handle}/`. Request bodies are JSON `{payload, proof?}`; all ordinary actions use POST. HTTPS is required outside loopback development. Responses are `no-store`. Public operational fields contain no tab URLs, titles, file paths or friendly device names.
+All routes are beneath `/v1/{64-character-account-handle}/`. Request bodies are JSON `{payload, proof?}`; all ordinary actions use POST. HTTPS is required outside loopback/private-LAN development. Responses are `no-store`. Public operational fields contain no tab URLs, titles, file paths or friendly device names.
 
 ## Authentication
 
-An authorized client asks `challenge` for `{device,purpose,digest}`. `digest` is base64 SHA-256 of canonical JSON of the complete action payload. The response binds version=1, account, device, purpose, random nonce, expiry and digest. The device checks all those fields and signs them with P-256 ECDSA/SHA-256. The action's proof is `{challenge,signature}`.
+An authorized client asks `challenge` for `{device,purpose,digest}`. `digest` is standard-base64 SHA-256 of canonical JSON of the complete action payload. The response binds version=1, account, device, purpose, random nonce, issued-at, expiry and digest. The device checks all those fields and signs them with P-256 ECDSA/SHA-256. Challenges last 30 seconds and tolerate at most 120 seconds of client/server clock skew; they are still consumed once by the server. The action's proof is `{challenge,signature}`.
 
 The coordinator persists and consumes challenges once, even for a failed signature attempt. Expiry is 30 seconds. Recovery challenges use the reserved actor `recovery` and are valid only for `recover-join`. No account number, opaque device ID or permanent bearer token grants authorization.
 

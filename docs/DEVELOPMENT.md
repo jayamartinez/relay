@@ -11,6 +11,8 @@ pnpm dev
 
 This builds development output at `apps/extension/dist` and starts the local Worker on port 8787. Alternatively run `pnpm dev:server` and `pnpm dev:extension` in separate terminals; the latter watches extension source. Reload the unpacked extension after a rebuild. Public HTML/CSS edits require restarting the build watcher or running a new build.
 
+For a two-computer LAN test, run `pnpm dev:server:lan` on the host and configure **both** profiles with the same normalized LAN origin, for example `http://192.168.1.50:8787`. Do not use `localhost` on one computer and the LAN IP on the other: those are distinct server origins even when they reach the same Worker. A trailing slash is normalized away.
+
 Open Helium/Chromium's extensions page in both profiles, enable Developer mode, choose **Load unpacked**, and select the same absolute `apps/extension/dist` directory. The minimum supported Chromium API level is 120. Helium variants must actually provide those APIs; this version has automated Chromium evidence, not a completed Helium certification matrix.
 
 On Windows, if your browser executable supports Chromium profile flags, you can launch separate profiles from PowerShell (replace the executable path; this command is not run automatically):
