@@ -1,0 +1,21 @@
+{
+  "name": "@relay/server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --ip 127.0.0.1 --port 8787",
+    "dev:lan": "wrangler dev --ip 0.0.0.0 --port 8787 --persist-to .wrangler/state",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@relay/crypto": "workspace:*",
+    "@relay/protocol": "workspace:*",
+    "@relay/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.1.4",
+    "wrangler": "4.129.0"
+  }
+}

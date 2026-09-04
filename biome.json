@@ -1,0 +1,17 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.12/schema.json",
+  "files": {
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/.wrangler",
+      "!pnpm-lock.yaml",
+      "!**/worker-configuration.d.ts",
+      "!output",
+      "!test-results"
+    ]
+  },
+  "formatter": { "indentStyle": "space", "lineWidth": 100 },
+  "linter": { "enabled": true, "rules": { "preset": "none" } },
+  "javascript": { "formatter": { "quoteStyle": "double" } }
+}

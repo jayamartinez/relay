@@ -1,0 +1,11 @@
+{
+  "name": "@relay/crypto",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@relay/protocol": "workspace:*",
+    "@relay/shared": "workspace:*"
+  }
+}
