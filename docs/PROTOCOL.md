@@ -34,6 +34,8 @@ Existing clients pin the last verified control. A new paired client pins the app
 
 ## Pairing state machine
 
+The requester signs a short-lived proof for each `pair-read` and `pair-reveal`, binding account, action, request ID, nonce, expiry and (for reveal) the complete reveal. These client-generated expiries use the same 120-second clock-skew bound as challenge validation: `serverNow - 120000 < expires <= serverNow + 30000 + 120000`. Used proof nonces remain stored until `expires + 120000`, including when the requester's clock is behind, so a proof cannot become replayable within its acceptance window. This is separate from the approximately ten-minute pairing-request lifetime. Signature, commitment, SAS and signed-membership checks remain mandatory.
+
 ```text
 requester                       coordinator                     approver
 commit ephemeral + random ──── pair-start ─────────────────────► Review

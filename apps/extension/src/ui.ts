@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import type { Status } from "./controller";
+import type { Controller, Status } from "./controller";
 export function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   className = "",
@@ -31,10 +31,16 @@ export function input(label: string, value = "", type = "text") {
   const wrapper = el("label", "", label, field);
   return { field, wrapper };
 }
-export async function call(action: string, payload: Record<string, unknown> = {}): Promise<Status> {
+type HealthResult = Awaited<ReturnType<Controller["health"]>>;
+export function call(action: "health", payload: { server: string }): Promise<HealthResult>;
+export function call(action: string, payload?: Record<string, unknown>): Promise<Status>;
+export async function call(
+  action: string,
+  payload: Record<string, unknown> = {},
+): Promise<Status | HealthResult> {
   const response = await chrome.runtime.sendMessage({ action, ...payload });
   if (!response?.ok) throw new Error(response?.error ?? "Relay background worker is unavailable.");
-  return response.value as Status;
+  return response.value as Status | HealthResult;
 }
 export const masked = (account: string) => `•••• •••• •••• •••• •••• ${account.slice(-4)}`;
 export const grouped = (account: string) => account.match(/.{4}/g)?.join(" ") ?? account;

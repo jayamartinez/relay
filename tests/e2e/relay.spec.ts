@@ -3,7 +3,7 @@ import { type BrowserContext, chromium, expect, type Page, test } from "@playwri
 import type { Status } from "../../apps/extension/src/controller";
 import { groupScenario } from "../group-scenario";
 
-const extension = path.resolve("apps/extension/dist");
+const extension = path.resolve(process.env.RELAY_TEST_EXTENSION || "apps/extension/dist");
 async function profile() {
   const context = await chromium.launchPersistentContext("", {
     channel: "chromium",
@@ -14,6 +14,10 @@ async function profile() {
   const extensionId = worker.url().split("/")[2];
   const page = await context.newPage();
   await page.goto(`chrome-extension://${extensionId}/settings.html`);
+  if (process.env.RELAY_TEST_SERVER) {
+    await page.getByText("Choose a server", { exact: true }).click();
+    await page.getByLabel("Relay server", { exact: true }).fill(process.env.RELAY_TEST_SERVER);
+  }
   return { context, page, worker };
 }
 async function command(
@@ -166,7 +170,7 @@ test("real two-profile pairing, tabs, offline resume, revocation and recovery", 
     await c.page.getByLabel("24-digit account number").fill(account);
     await expect(
       command(c.page, "recover", {
-        server: "http://localhost:8787",
+        server: process.env.RELAY_TEST_SERVER || "http://localhost:8787",
         account,
         name: "Recovery test device",
         code: "0".repeat(64),

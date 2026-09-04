@@ -106,6 +106,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return controller.create(message.server, message.name);
       case "start":
         return controller.start();
+      case "health":
+        return controller.health(message.server);
       case "join":
         return controller.join(message.server, message.account, message.name);
       case "review":

@@ -38,6 +38,12 @@ async function act(action: string, payload: Record<string, unknown> = {}) {
     screen = "welcome";
     render();
   } catch (error) {
+    try {
+      state = await call("status");
+      render();
+    } catch {
+      // Keep the original action error if status itself cannot be refreshed.
+    }
     report(error);
   } finally {
     busy = false;
@@ -79,7 +85,25 @@ function controls() {
         : "No official service is configured in this build. Use a self-hosted server.",
     ),
   );
+  if (__DEV__) detail.append(button("Test connection", () => void testConnection()));
   return el("div", "", name.wrapper, detail);
+}
+async function testConnection() {
+  if (busy) return;
+  busy = true;
+  try {
+    const origin = serverOrigin(serverValue || state.server, true);
+    const granted = await chrome.permissions.request({ origins: [`${origin}/*`] });
+    if (!granted) throw new Error("Server permission was denied. No connection was made.");
+    const result = await call("health", { server: origin });
+    state = await call("status");
+    render();
+    app?.append(el("p", result.ok ? "" : "error", result.message));
+  } catch (error) {
+    report(error);
+  } finally {
+    busy = false;
+  }
 }
 async function withPermission(action: string, payload: Record<string, unknown>) {
   try {
@@ -103,7 +127,7 @@ function confirmation(label: string, onConfirm: () => void, buttonLabel: string)
 }
 function onboarding(): HTMLElement {
   const body = el("div", "onboarding section");
-  if (state.phase === "draft") {
+  if (state.phase === "draft" && state.recovery) {
     body.append(
       el("div", "eyebrow", "01 — Keep your recovery information"),
       el("h1", "", "Your Relay account"),
@@ -151,6 +175,7 @@ function onboarding(): HTMLElement {
         "Start syncing",
       ),
     );
+    body.append(button("Cancel setup", () => void act("cancel")));
   } else if (state.phase === "pending" && screen !== "recover") {
     body.append(
       el("div", "eyebrow", "02 — Authorize this device"),
@@ -263,6 +288,7 @@ function onboarding(): HTMLElement {
         }),
       ),
     );
+    if (state.phase === "draft") body.append(button("Cancel setup", () => void act("cancel")));
   } else {
     body.append(
       el("div", "eyebrow", "Built for Helium"),
@@ -561,11 +587,31 @@ function settings() {
 }
 function render() {
   if (!app) return;
+  // A join/recovery draft has no newly generated recovery key. Keep it retryable,
+  // including after a settings-page reload, instead of offering Start syncing.
+  if (state.phase === "draft" && !state.recovery && screen === "welcome") screen = "join";
   app.className = "shell";
   app.replaceChildren(brand());
-  if (state.error) app.append(el("p", "error", state.error));
+  if (state.error) {
+    const error = el("p", "error", state.error);
+    error.id = "error";
+    app.append(error);
+  }
   if (state.phase === "active") app.append(settings());
   else app.append(onboarding());
+  if (__DEV__) {
+    if ((state.phase === "draft" && state.recovery) || state.phase === "active")
+      app.append(button("Test connection", () => void testConnection()));
+    if (state.startTrace?.length)
+      app.append(
+        el(
+          "details",
+          "",
+          el("summary", "", "Development connection trace"),
+          el("pre", "", state.startTrace.join("\n")),
+        ),
+      );
+  }
   app.append(
     el(
       "footer",

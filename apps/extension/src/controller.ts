@@ -129,6 +129,7 @@ export class Controller {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectAttempt = 0;
   private lastSocketMessage = 0;
+  private startTrace: string[] = [];
   private network = "Not connected";
   private error = "";
   private halted = false;
@@ -138,7 +139,12 @@ export class Controller {
   private preferences: SyncPreferencesV1 = defaultSyncPreferences();
   private api(): Api {
     const s = this.require();
-    return new Api(s.server, s.handle);
+    return new Api(s.server, s.handle, (event) => this.recordStartTrace(event));
+  }
+  private recordStartTrace(event: string) {
+    if (!__DEV__) return;
+    this.startTrace.push(event);
+    if (this.startTrace.length > 60) this.startTrace.shift();
   }
   private require(): Local {
     assert(this.local, "Set up Relay first.");
@@ -382,8 +388,21 @@ export class Controller {
     );
   }
   async start() {
+    this.startTrace = [];
+    this.recordStartTrace("Controller.start entered");
+    if (__DEV__) console.debug("[Relay start] entered Controller.start");
     const s = this.require();
     assert(s.phase === "draft" && s.control && s.root, "Account setup is incomplete.");
+    this.halted = false;
+    this.error = "";
+    this.recordStartTrace("Draft state valid");
+    if (__DEV__) console.debug("[Relay start] draft state valid");
+    if (__DEV__) {
+      const origin = serverOrigin(s.server, true);
+      this.recordStartTrace(`[Relay:start] canonical server = ${origin}`);
+      const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] });
+      this.recordStartTrace(`[Relay:start] host permission = ${granted}`);
+    }
     if (!s.initialSnapshot) {
       const initial = initialMerge(
         await browserWindows(),
@@ -410,6 +429,10 @@ export class Controller {
       s.initialSnapshot = await this.envelope("snapshot", 0, 0, s.canonical);
       await this.persist();
     }
+    this.recordStartTrace("Initial snapshot ready");
+    if (__DEV__) console.debug("[Relay start] initial snapshot ready");
+    if (__DEV__) console.debug("[Relay start] calling Api.post(create)");
+    this.recordStartTrace("Calling Api.post(create)");
     await this.api().post("create", { control: s.control, snapshot: s.initialSnapshot });
     s.phase = "active";
     this.lifecycle = "LIVE";
@@ -421,7 +444,26 @@ export class Controller {
     await this.connect();
     return this.status();
   }
+  async health(server: string) {
+    if (!__DEV__) throw new Error("Server diagnostics are available only in development builds.");
+    this.startTrace = [];
+    try {
+      const origin = serverOrigin(server, true);
+      this.recordStartTrace(`[Relay:health] canonical server = ${origin}`);
+      const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] });
+      this.recordStartTrace(`[Relay:health] host permission = ${granted}`);
+      await new Api(origin, "", (event) => this.recordStartTrace(event)).health();
+      return { ok: true, message: "Relay protocol v1 connected (HTTP 200)." };
+    } catch (error) {
+      // A user-initiated probe must not halt an otherwise active account.
+      return {
+        ok: false,
+        message: error instanceof Error ? error.message : "Connection test failed.",
+      };
+    }
+  }
   async join(server: string, account: string, name: string) {
+    this.startTrace = [];
     const normalizedServer = serverOrigin(server, __DEV__);
     const normalizedAccount = canonicalAccount(account);
     const s = this.local ?? (await this.newLocal(normalizedAccount, normalizedServer, name));
@@ -604,6 +646,7 @@ export class Controller {
     return this.status();
   }
   async recover(server: string, account: string, name: string, code: string) {
+    this.startTrace = [];
     const s = this.local ?? (await this.newLocal(account, server, name));
     assert(s.phase !== "active", "This device is already authorized.");
     assert(
@@ -1315,6 +1358,7 @@ export class Controller {
       diagnostics: __DEV__ ? s?.diagnostics : undefined,
       lifecycle: this.lifecycle,
       behavior: diagnosticSnapshot(),
+      startTrace: __DEV__ ? [...this.startTrace] : undefined,
     };
   }
 }

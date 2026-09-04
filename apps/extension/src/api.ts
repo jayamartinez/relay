@@ -1,13 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { hash, sign } from "@relay/crypto";
 import { CHALLENGE_LIFETIME_MS, type Challenge, CLOCK_SKEW_MS } from "@relay/protocol";
-import { assert, canonical, id, integer, LIMITS, record, text } from "@relay/shared";
+import { assert, canonical, id, integer, LIMITS, record, serverOrigin, text } from "@relay/shared";
+
+declare const __DEV__: boolean;
+
+// Browser errors can include URLs or user data. Only known runtime messages are
+// safe to copy into diagnostics; the original exception stays on Error.cause.
+function errorDetails(error: unknown): string {
+  const name = error instanceof Error && /^[A-Za-z]+Error$/.test(error.name) ? error.name : "Error";
+  const message = error instanceof Error ? error.message : "";
+  const safe =
+    /^(Failed to fetch|signal timed out|The operation timed out\.?|The operation was aborted\.?|The user aborted a request\.?|AbortSignal\.timeout is not a function)$/.test(
+      message,
+    );
+  return `${name}: ${safe ? message : "details withheld (may contain private data)"}`;
+}
 export class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly code = "SERVER_REQUEST_FAILED",
+    readonly stage = "SERVER_VALIDATION",
+    cause?: unknown,
   ) {
-    super(message);
+    super(message, { cause });
   }
 }
 export type ChallengeValidationFailure =
@@ -75,22 +92,113 @@ export class Api {
   constructor(
     readonly origin: string,
     readonly account: string,
+    readonly onTrace?: (event: string) => void,
   ) {}
-  async post<T>(action: string, payload: unknown, proof?: unknown): Promise<T> {
+  private trace(action: string, event: string) {
+    if (!__DEV__) return;
+    const enrollment = [
+      "create",
+      "health",
+      "pair-start",
+      "pair-read",
+      "pair-reveal",
+      "recover-info",
+      "recover-join",
+    ].includes(action);
+    if (!enrollment && !/failed|rejected|VALIDATION/.test(event)) return;
+    const message = `[Relay:api] ${action} ${event}`;
+    this.onTrace?.(message);
+    console.debug(message);
+  }
+  private prepare<T>(action: string, stage: string, operation: () => T): T {
+    try {
+      const value = operation();
+      this.trace(action, `${stage} successful`);
+      return value;
+    } catch (cause) {
+      this.trace(action, `${stage} failed — ${errorDetails(cause)}`);
+      throw new Error(`Relay request preparation failed (${stage}_FAILED).`, { cause });
+    }
+  }
+  private endpoint(action: string): string {
+    return this.prepare(action, "ENDPOINT", () => {
+      const origin = serverOrigin(this.origin, __DEV__);
+      assert(/^[a-z-]+$/.test(action), "Invalid Relay action.");
+      if (action === "health") return `${origin}/health`;
+      assert(/^[a-f0-9]{64}$/.test(this.account), "Invalid Relay account handle.");
+      return `${origin}/v1/${this.account}/${action}`;
+    });
+  }
+  private async request(action: string, url: string, body?: string): Promise<Response> {
+    const init = this.prepare<RequestInit>(action, "REQUEST_SETUP", () => ({
+      method: body === undefined ? "GET" : "POST",
+      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+      body,
+      credentials: "omit",
+      redirect: "error",
+      cache: "no-store",
+      signal: AbortSignal.timeout(12_000),
+    }));
+    this.trace(action, "FETCH invoking fetch");
     let response: Response;
     try {
-      response = await fetch(`${this.origin}/v1/${this.account}/${action}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ payload, proof }),
-        credentials: "omit",
-        redirect: "error",
-        cache: "no-store",
-        signal: AbortSignal.timeout(12_000),
-      });
-    } catch {
-      throw new ApiError(0, "Relay server is unreachable. Your local changes are saved.");
+      response = await fetch(url, init);
+    } catch (cause) {
+      this.trace(action, `FETCH rejected — ${errorDetails(cause)}`);
+      const timeout = cause instanceof Error && cause.name === "TimeoutError";
+      throw new ApiError(
+        0,
+        timeout
+          ? "Relay server did not respond within 12 seconds. Your local changes are saved."
+          : "Relay server is unreachable. Your local changes are saved.",
+        timeout ? "NETWORK_TIMEOUT" : "NETWORK_FETCH_FAILED",
+        "FETCH",
+        cause,
+      );
     }
+    this.trace(action, `FETCH returned HTTP ${response.status}`);
+    return response;
+  }
+  async post<T>(action: string, payload: unknown, proof?: unknown): Promise<T> {
+    const url = this.endpoint(action);
+    const body = this.prepare(action, "SERIALIZATION", () => JSON.stringify({ payload, proof }));
+    if (__DEV__)
+      this.trace(action, `body size: ${new TextEncoder().encode(body).byteLength} bytes`);
+    const response = await this.request(action, url, body);
+    return (await this.readResponse(action, response)) as T;
+  }
+  private async readResponse(action: string, response: Response): Promise<unknown> {
+    let parsed: unknown;
+    try {
+      parsed = await this.parseResponse(response);
+    } catch (cause) {
+      this.trace(action, `RESPONSE_PARSE failed — ${errorDetails(cause)}`);
+      throw new Error("Relay could not read the server response (RESPONSE_PARSE_FAILED).", {
+        cause,
+      });
+    }
+    if (!response.ok) {
+      const error = record(parsed).error;
+      const structured = error && typeof error === "object" ? record(error) : undefined;
+      const code =
+        typeof structured?.code === "string" && /^[A-Z_]{1,80}$/.test(structured.code)
+          ? structured.code
+          : "SERVER_REQUEST_FAILED";
+      this.trace(action, `SERVER_VALIDATION code=${code}`);
+      throw new ApiError(
+        response.status,
+        typeof error === "string"
+          ? error
+          : typeof structured?.message === "string"
+            ? structured.message
+            : "Server request failed.",
+        code,
+      );
+    }
+    this.trace(action, "RESPONSE_PARSE successful");
+    return parsed;
+  }
+  private async parseResponse(response: Response): Promise<unknown> {
     const reader = response.body?.getReader();
     const decoder = new TextDecoder();
     let content = "";
@@ -107,24 +215,17 @@ export class Api {
         content += decoder.decode(chunk.value, { stream: true });
       }
     content += decoder.decode();
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      throw new Error("The server returned unexpected data.");
-    }
-    if (!response.ok) {
-      const error = record(parsed).error;
-      throw new ApiError(
-        response.status,
-        typeof error === "string"
-          ? error
-          : error && typeof error === "object" && typeof record(error).message === "string"
-            ? (record(error).message as string)
-            : "Server request failed.",
-      );
-    }
-    return parsed as T;
+    return JSON.parse(content);
+  }
+  async health() {
+    const response = await this.request("health", this.endpoint("health"));
+    const value = record(await this.readResponse("health", response));
+    assert(
+      value.name === "Relay" && value.protocolVersion === 1,
+      "The server is not a compatible Relay server (HEALTH_PROTOCOL_MISMATCH).",
+    );
+    this.trace("health", "Relay protocol v1 verified");
+    return { status: response.status, name: "Relay", protocolVersion: 1 };
   }
   async authenticated<T>(
     action: string,
@@ -132,9 +233,31 @@ export class Api {
     device: string,
     key: CryptoKey,
   ): Promise<T> {
-    const digest = await hash(canonical(payload));
+    let digest: string;
+    try {
+      digest = await hash(canonical(payload));
+    } catch (cause) {
+      this.trace(action, `PROOF_DIGEST failed — ${errorDetails(cause)}`);
+      throw new Error("Relay could not construct request proof (PROOF_DIGEST_FAILED).", { cause });
+    }
     const challenge = await this.post<Challenge>("challenge", { device, purpose: action, digest });
-    validateChallenge(challenge, { account: this.account, device, purpose: action, digest });
-    return this.post(action, payload, { challenge, signature: await sign(key, challenge) });
+    this.trace(action, "CHALLENGE response received");
+    try {
+      validateChallenge(challenge, { account: this.account, device, purpose: action, digest });
+    } catch (error) {
+      this.trace(
+        action,
+        `CHALLENGE_VALIDATION code=${error instanceof ChallengeValidationError ? error.code : "SCHEMA_INVALID"}`,
+      );
+      throw error;
+    }
+    let signature: string;
+    try {
+      signature = await sign(key, challenge);
+    } catch (cause) {
+      this.trace(action, `PROOF_SIGNATURE failed — ${errorDetails(cause)}`);
+      throw new Error("Relay could not sign request proof (PROOF_SIGNATURE_FAILED).", { cause });
+    }
+    return this.post(action, payload, { challenge, signature });
   }
 }

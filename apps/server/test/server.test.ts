@@ -45,6 +45,71 @@ async function client() {
   return { ...f, stub, post, auth };
 }
 describe("SQLite Durable Object", () => {
+  it.each([-60_000, 60_000])(
+    "accepts pairing read/reveal clock skew %i while rejecting replay and tampering",
+    async (skew) => {
+      const f = await client();
+      const joiner = await identity();
+      const e = await ephemeral();
+      const start = {
+        id: crypto.randomUUID(),
+        device: joiner.device,
+        commitment: e.commitment,
+        expires: Date.now() + 590_000 + skew,
+      };
+      expect(
+        (
+          await f.post("pair-start", {
+            ...start,
+            signature: await sign(joiner.signing, {
+              version: 1,
+              account: f.handle,
+              type: "pair-start",
+              ...start,
+            }),
+          })
+        ).status,
+      ).toBe(200);
+      const offer = await ephemeral();
+      expect(
+        (await f.auth("pair-offer", { id: start.id, commitment: offer.commitment })).status,
+      ).toBe(200);
+      for (const action of ["pair-read", "pair-reveal"]) {
+        const proof = {
+          version: 1,
+          account: f.handle,
+          action,
+          id: start.id,
+          nonce: crypto.randomUUID(),
+          expires: Date.now() + 25_000 + skew,
+          ...(action === "pair-reveal" ? { reveal: e.reveal } : {}),
+        };
+        const payload = { ...proof, signature: await sign(joiner.signing, proof) };
+        const tampered = await f.post(action, { ...payload, nonce: crypto.randomUUID() });
+        expect(tampered.status).toBe(400);
+        expect((await f.post(action, payload)).status).toBe(200);
+        const replay = await f.post(action, payload);
+        expect(replay.status).toBe(400);
+        expect((await replay.json()).error.code).toBe("PAIR_PROOF_REPLAYED");
+      }
+      for (const skew of [-180_000, 180_000]) {
+        const proof = {
+          version: 1,
+          account: f.handle,
+          action: "pair-read",
+          id: start.id,
+          nonce: crypto.randomUUID(),
+          expires: Date.now() + 25_000 + skew,
+        };
+        const response = await f.post("pair-read", {
+          ...proof,
+          signature: await sign(joiner.signing, proof),
+        });
+        expect(response.status).toBe(400);
+        expect((await response.json()).error.code).toBe("PAIR_PROOF_TIMESTAMP_INVALID");
+      }
+    },
+  );
   it("rejects expired pairing and makes denial a terminal one-time transition", async () => {
     const f = await client();
     const joiner = await identity();

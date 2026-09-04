@@ -13,6 +13,16 @@ This builds development output at `apps/extension/dist` and starts the local Wor
 
 For a two-computer LAN test, run `pnpm dev:server:lan` on the host and configure **both** profiles with the same normalized LAN origin, for example `http://192.168.1.50:8787`. Do not use `localhost` on one computer and the LAN IP on the other: those are distinct server origins even when they reach the same Worker. A trailing slash is normalized away.
 
+### Connection diagnostics
+
+The ordinary `pnpm build:extension:dev` build includes **Test connection** in server setup and on draft/active account screens. It requests the selected host permission through a user gesture, then fetches `/health` from the same background service worker used by `/create`. Success requires `{name:"Relay",protocolVersion:1}`, not just HTTP 200. The probe does not change the account's sync state.
+
+Expand **Development connection trace** after a failed action, or inspect the Relay service worker console with verbose/debug messages enabled. Copy only the trace and the visible error, not account/recovery fields or browser storage. The trace contains the canonical server origin, host-permission result, preparation stages, byte count, HTTP status, safe runtime error name/message, and validation codes. Arbitrary error text is withheld because it can contain private data; original exceptions remain attached as `Error.cause`. No request bodies, keys, workspace content or browsing URLs are logged. Successful routine sync requests stay quiet. Production builds omit these diagnostics.
+
+`FETCH rejected — TimeoutError: signal timed out` means fetch was invoked but no response arrived before the 12-second deadline. `ENDPOINT_FAILED`, `SERIALIZATION_FAILED` and `REQUEST_SETUP_FAILED` indicate local preparation problems. `PAIR_REQUEST_TIMESTAMP_INVALID`, `PAIR_PROOF_TIMESTAMP_INVALID` and `CHALLENGE_VALIDATION code=...` identify protocol failures without weakening checks.
+
+If even background `/health` times out, compare a bounded host request (`curl.exe --max-time 5 http://192.168.1.176:8787/health` on Windows). A listening port is not proof that Wrangler is processing requests. Stop/restart Wrangler in its existing terminal if necessary, retaining `apps/server/.wrangler/state`. Do not clear extension storage or delete server state as a networking fix. Restart Wrangler and reload **both** rebuilt extensions before testing a changed protocol implementation.
+
 Open Helium/Chromium's extensions page in both profiles, enable Developer mode, choose **Load unpacked**, and select the same absolute `apps/extension/dist` directory. The minimum supported Chromium API level is 120. Helium variants must actually provide those APIs; this version has automated Chromium evidence, not a completed Helium certification matrix.
 
 On Windows, if your browser executable supports Chromium profile flags, you can launch separate profiles from PowerShell (replace the executable path; this command is not run automatically):
@@ -82,3 +92,7 @@ pnpm test:e2e
 The end-to-end tests create disposable Chromium profiles, use real extension APIs and the local Worker, and never use everyday profiles. They cover cryptographic pairing, one-window initial merge, one-load navigation, local-only omission, deliberate multi-window changes, final-window and rapid multi-window shutdown, restart identity, offline work, revocation, recovery, and optional groups. Diagnostics are local, bounded, sanitized, and enabled only for this test build. Run `pnpm test:google` separately for the explicit external-network probe.
 
 `pnpm test:e2e` leaves the development build in `dist`. Run `pnpm build` again to inspect production output. No command above commits, pushes, publishes or deploys.
+
+For an isolated Worker, the browser tests accept `RELAY_TEST_SERVER` (for example `http://192.168.1.176:8788`). `RELAY_TEST_EXTENSION` can select an explicitly prepared disposable extension copy. Headless Chromium may leave its native optional-host-permission prompt unanswered; for transport tests only, copy the built extension under `output/`, add the one selected host match pattern to that copy's `host_permissions`, and point `RELAY_TEST_EXTENSION` there. This pregrants permission and therefore does **not** test the native approval dialog. Never copy that test manifest back into `apps/extension/dist` or use it for the physical-device handoff. The normal build continues requesting optional host access from the user.
+
+For the final LAN handoff, run production checks first, then **`pnpm build:extension:dev` last**. Load `apps/extension/dist` on Windows and copy that entire directory (or build the same uncommitted source) on Mac. A Git pull alone will not include local fixes that have not been committed.

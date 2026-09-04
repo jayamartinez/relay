@@ -3,7 +3,7 @@ import { chromium, expect, type Page } from "@playwright/test";
 import type { Status } from "../apps/extension/src/controller";
 
 export async function profile(directory = "") {
-  const extension = path.resolve("apps/extension/dist");
+  const extension = path.resolve(process.env.RELAY_TEST_EXTENSION || "apps/extension/dist");
   const context = await chromium.launchPersistentContext(directory, {
     channel: "chromium",
     headless: true,
@@ -12,6 +12,10 @@ export async function profile(directory = "") {
   const worker = context.serviceWorkers()[0] ?? (await context.waitForEvent("serviceworker"));
   const page = await context.newPage();
   await page.goto(`chrome-extension://${worker.url().split("/")[2]}/settings.html`);
+  if (process.env.RELAY_TEST_SERVER && (await status(page)).phase === "welcome") {
+    await page.getByText("Choose a server", { exact: true }).click();
+    await page.getByLabel("Relay server", { exact: true }).fill(process.env.RELAY_TEST_SERVER);
+  }
   return { context, page, worker };
 }
 export async function command(

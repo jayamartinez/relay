@@ -303,14 +303,15 @@ export class RelayAccount extends DurableObject<Env> {
         !(device === "recovery" && purpose === "recover-join")
       )
         fail(403, "Device is not authorized.");
+      const issued = Date.now();
       const challenge: Challenge = {
         version: 1,
         account,
         device,
         purpose,
         nonce: crypto.randomUUID(),
-        issued: Date.now(),
-        expires: Date.now() + CHALLENGE_LIFETIME_MS,
+        issued,
+        expires: issued + CHALLENGE_LIFETIME_MS,
         digest: text(p.digest, 64),
       };
       this.temporary(`challenge:${challenge.nonce}`, challenge, challenge.expires);
@@ -370,11 +371,15 @@ export class RelayAccount extends DurableObject<Env> {
       const pair = this.pair(p.id);
       const nonce = text(p.nonce, 64);
       const expires = integer(p.expires);
-      assert(
-        expires > Date.now() &&
-          expires <= Date.now() + 30_000 &&
-          !this.readTemporary(`pair-proof:${nonce}`),
-      );
+      const now = Date.now();
+      if (expires <= now - CLOCK_SKEW_MS || expires > now + CHALLENGE_LIFETIME_MS + CLOCK_SKEW_MS)
+        fail(
+          400,
+          "The pairing proof timestamp is invalid. Check your system clock.",
+          "PAIR_PROOF_TIMESTAMP_INVALID",
+        );
+      if (this.readTemporary(`pair-proof:${nonce}`))
+        fail(400, "This pairing proof was already used.", "PAIR_PROOF_REPLAYED");
       const signed = {
         version: 1,
         account,
@@ -384,8 +389,11 @@ export class RelayAccount extends DurableObject<Env> {
         expires,
         ...(action === "pair-reveal" ? { reveal: p.reveal } : {}),
       };
-      assert(await verify(pair.device.auth, signed, text(p.signature, 256)));
-      this.temporary(`pair-proof:${nonce}`, true, expires);
+      if (!(await verify(pair.device.auth, signed, text(p.signature, 256))))
+        fail(400, "Relay could not verify this pairing proof.", "PAIR_PROOF_SIGNATURE_INVALID");
+      // Retain the nonce through the entire skew-adjusted acceptance window.
+      // Storing only until expires would let a slow clock replay its proof.
+      this.temporary(`pair-proof:${nonce}`, true, expires + CLOCK_SKEW_MS);
       if (action === "pair-reveal") {
         assert(pair.status === "pending" && pair.offer && !pair.requesterReveal);
         const reveal = this.reveal(p.reveal);
