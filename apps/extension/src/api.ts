@@ -40,8 +40,14 @@ export function validateChallenge(
       device: id(value.device),
       purpose: text(value.purpose, 40),
       nonce: id(value.nonce),
-      issued: integer(value.issued),
       expires: integer(value.expires),
+      // Older v1 Workers did not include issued-at. Keep the received shape
+      // untouched for its signature, but derive the known 30-second lifetime
+      // locally so a rebuilt extension can still authenticate with one.
+      issued:
+        value.issued === undefined
+          ? integer(value.expires) - CHALLENGE_LIFETIME_MS
+          : integer(value.issued),
       digest: text(value.digest, 64),
     };
   } catch {

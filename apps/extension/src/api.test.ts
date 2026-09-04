@@ -20,6 +20,14 @@ const challenge = {
 it("accepts a bounded server/client clock difference for challenges", () => {
   expect(validateChallenge(challenge, expected, now + 90_000)).toEqual(challenge);
 });
+it("accepts an older v1 challenge that omitted issued-at", () => {
+  const legacy = { ...challenge } as Record<string, unknown>;
+  delete legacy.issued;
+  expect(validateChallenge(legacy, expected, now)).toMatchObject({
+    ...challenge,
+    issued: now,
+  });
+});
 it.each([
   ["ACCOUNT_HANDLE_MISMATCH", { account: "other" }],
   ["PURPOSE_MISMATCH", { purpose: "push" }],
