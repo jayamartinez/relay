@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { serverOrigin } from "@relay/shared";
 import type { Status } from "./controller";
-import { ago, brand, button, call, el, grouped, input, masked } from "./ui";
+import {
+  ago,
+  brand,
+  button,
+  call,
+  el,
+  grouped,
+  groupedCode,
+  input,
+  masked,
+  statusBadge,
+  switchControl,
+} from "./ui";
 
 declare const __DEV__: boolean;
 declare const __REPOSITORY_URL__: string;
@@ -22,13 +34,24 @@ let accountValue = "";
 function report(error: unknown) {
   const old = document.getElementById("error");
   old?.remove();
-  const message = el(
-    "p",
-    "error",
+  const message = errorMessage(
     error instanceof Error ? error.message : "Relay could not complete this action.",
   );
+  const target = app?.querySelector<HTMLElement>(".onboarding, .grid > .section");
+  if (target) target.prepend(message);
+  else app?.append(message);
+}
+
+function errorMessage(text: string): HTMLElement {
+  const message = el(
+    "div",
+    "error",
+    el("span", "error-title", "Couldn’t complete that"),
+    el("p", "", text),
+  );
   message.id = "error";
-  app?.prepend(message);
+  message.setAttribute("role", "alert");
+  return message;
 }
 async function act(action: string, payload: Record<string, unknown> = {}) {
   if (busy) return;
@@ -74,7 +97,7 @@ function controls() {
   };
   const detail = el(
     "details",
-    "",
+    "server-disclosure",
     el("summary", "", state.official ? "Server settings" : "Choose a server"),
     server.wrapper,
     el(
@@ -115,7 +138,12 @@ async function withPermission(action: string, payload: Record<string, unknown>) 
     report(error);
   }
 }
-function confirmation(label: string, onConfirm: () => void, buttonLabel: string) {
+function confirmation(
+  label: string,
+  onConfirm: () => void,
+  buttonLabel: string,
+  secondary?: HTMLElement,
+) {
   const checkbox = el("input");
   checkbox.type = "checkbox";
   const submit = button(buttonLabel, onConfirm, "primary");
@@ -123,10 +151,17 @@ function confirmation(label: string, onConfirm: () => void, buttonLabel: string)
   checkbox.onchange = () => {
     submit.disabled = !checkbox.checked;
   };
-  return el("div", "checks", el("label", "", checkbox, label), el("div", "actions", submit));
+  const actions = el("div", "actions");
+  if (secondary) actions.append(secondary);
+  actions.append(submit);
+  return el("div", "checks", el("label", "check-label", checkbox, el("span", "", label)), actions);
 }
 function onboarding(): HTMLElement {
-  const body = el("div", "onboarding section");
+  const welcome = state.phase === "welcome" && screen === "welcome";
+  const body = el(
+    "div",
+    `onboarding section ${welcome ? "onboarding-welcome" : "onboarding-flow"}`,
+  );
   if (state.phase === "draft" && state.recovery) {
     body.append(
       el("div", "eyebrow", "01 — Keep your recovery information"),
@@ -189,7 +224,7 @@ function onboarding(): HTMLElement {
     if (state.pair?.sas)
       body.append(
         el("div", "eyebrow", "Verification code"),
-        el("div", "code", state.pair.sas),
+        el("div", "code", groupedCode(state.pair.sas)),
         el(
           "p",
           "",
@@ -246,6 +281,7 @@ function onboarding(): HTMLElement {
       el("h1", "", screen === "join" ? "Enter your account number" : "Use your recovery key"),
     );
     const account = input("24-digit account number", state.account ?? accountValue);
+    account.field.className = "account-field";
     account.field.inputMode = "numeric";
     account.field.oninput = () => {
       accountValue = account.field.value;
@@ -253,6 +289,7 @@ function onboarding(): HTMLElement {
     body.append(account.wrapper, controls());
     if (screen === "recover") {
       const code = input("Recovery key", "", "password");
+      code.field.className = "recovery-field";
       body.append(
         code.wrapper,
         el("p", "", "Your key is decrypted on this device. It is never sent to the server."),
@@ -268,15 +305,19 @@ function onboarding(): HTMLElement {
       );
     } else
       body.append(
-        button(
-          "Request approval",
-          () => void withPermission("join", { account: account.field.value }),
-          "primary",
+        el(
+          "div",
+          "actions",
+          button(
+            "Request approval",
+            () => void withPermission("join", { account: account.field.value }),
+            "primary",
+          ),
+          button("Use recovery key", () => {
+            screen = "recover";
+            render();
+          }),
         ),
-        button("Use recovery key", () => {
-          screen = "recover";
-          render();
-        }),
       );
     body.append(
       el(
@@ -291,28 +332,21 @@ function onboarding(): HTMLElement {
     if (state.phase === "draft") body.append(button("Cancel setup", () => void act("cancel")));
   } else {
     body.append(
-      el("div", "eyebrow", "Built for Helium"),
       el("h1", "", "Your Helium workspace, everywhere."),
       el(
         "p",
         "",
-        "Keep tabs and windows in step across your computers. End-to-end encrypted. No email. No password.",
+        "Real-time synchronization between your devices. End-to-end encrypted. No email. No password.",
       ),
       controls(),
       el(
         "div",
-        "actions",
+        "actions onboarding-actions",
         button("Create Relay account", () => void withPermission("create", {}), "primary"),
-      ),
-      el("p", "", "Already use Relay?"),
-      button("Enter account number", () => {
-        screen = "join";
-        render();
-      }),
-      el(
-        "p",
-        "divider",
-        "Only workspace structure is shared. Your active tab, window layout, and browsing sessions stay local.",
+        button("Enter account number", () => {
+          screen = "join";
+          render();
+        }),
       ),
     );
   }
@@ -323,20 +357,21 @@ function devicePanel() {
     "div",
     "section",
     el("h2", "", "Devices"),
-    el("p", "", "Friendly names are end-to-end encrypted."),
+    el("p", "section-intro", "Friendly names are end-to-end encrypted."),
   );
   for (const pending of state.approvals) {
-    const row = el("div", "banner", el("h3", "", "New device request"));
+    const row = el("div", "banner device-request", el("div", "eyebrow", "New device request"));
     if (pending.sas) {
       row.append(
-        el("div", "code", pending.sas),
+        el("div", "code", groupedCode(pending.sas)),
         confirmation(
           "I started this request and the codes match on both devices.",
           () => void act("approve", { id: pending.id, code: pending.sas }),
           "Approve",
+          button("Deny", () => void act("deny", { id: pending.id }), "danger compact"),
         ),
       );
-    } else
+    } else {
       row.append(
         el(
           "p",
@@ -345,37 +380,45 @@ function devicePanel() {
             ? "Waiting for the pairing exchange. Keep both setup pages open."
             : "Verify the other device before allowing access.",
         ),
+        el(
+          "div",
+          "actions",
+          ...(!pending.reviewing
+            ? [button("Review", () => void act("review", { id: pending.id }), "secondary compact")]
+            : []),
+          button("Deny", () => void act("deny", { id: pending.id }), "danger compact"),
+        ),
       );
-    row.append(
-      el(
-        "div",
-        "actions",
-        ...(!pending.reviewing
-          ? [button("Review", () => void act("review", { id: pending.id }))]
-          : []),
-        button("Deny", () => void act("deny", { id: pending.id }), "danger"),
-      ),
-    );
+    }
     body.append(row);
   }
   for (const device of state.devices) {
     const row = el(
       "div",
-      "row",
+      "row device-row",
       el(
         "div",
         "",
-        el("h3", "", device.name, device.id === state.device ? " · This device" : ""),
-        el("small", "", device.online ? "Online" : `Last seen ${ago(device.lastSeen)}`),
+        el("h3", "", device.name),
+        el(
+          "small",
+          "device-meta",
+          device.id === state.device ? "This device · " : "",
+          device.online ? "Online" : `Last seen ${ago(device.lastSeen)}`,
+        ),
       ),
     );
     const actions = el(
       "div",
       "actions",
-      button("Rename", () => {
-        const name = prompt("Device name", device.name);
-        if (name?.trim()) void act("rename", { id: device.id, name });
-      }),
+      button(
+        "Rename",
+        () => {
+          const name = prompt("Device name", device.name);
+          if (name?.trim()) void act("rename", { id: device.id, name });
+        },
+        "ghost compact",
+      ),
     );
     if (device.id !== state.device)
       actions.append(
@@ -389,7 +432,7 @@ function devicePanel() {
             )
               void act("revoke", { id: device.id });
           },
-          "danger",
+          "danger compact",
         ),
       );
     row.append(actions);
@@ -404,20 +447,20 @@ function preferenceRow(
   unavailable = false,
   note?: string,
 ) {
-  const row = el("div", "row", el("div", "", el("h3", "", name), el("small", "", description)));
-  const toggle = el("input") as HTMLInputElement;
-  toggle.type = "checkbox";
-  toggle.checked = !!state.preferences[key];
-  toggle.disabled = unavailable;
-  toggle.onchange = () => void act("preferences", { preferences: { [key]: toggle.checked } });
-  row.append(el("label", "", toggle, unavailable ? " Unavailable" : " On"));
-  if (note) row.append(el("small", "", note));
+  const copy = el("div", "preference-copy", el("h3", "", name), el("small", "", description));
+  if (note) copy.append(el("small", "preference-note", note));
+  const row = el("div", "row preference-row", copy);
+  row.append(
+    switchControl(name, !!state.preferences[key], unavailable, (checked) => {
+      void act("preferences", { preferences: { [key]: checked } });
+    }),
+  );
   return row;
 }
 function settings() {
   const nav = el("nav", "nav");
   nav.setAttribute("aria-label", "Settings");
-  for (const name of ["General", "Devices", "Security", "Server", "About"]) {
+  for (const name of ["General", "Synchronization", "Devices", "Security", "Server", "About"]) {
     const b = button(name, () => {
       section = name;
       render();
@@ -428,7 +471,7 @@ function settings() {
   let content = el("div", "section", el("h2", "", section));
   if (section === "General")
     content.append(
-      el("div", "status", state.status),
+      statusBadge(state.status),
       el("h3", "divider", "Main workspace"),
       el("p", "metric", `${state.workspace?.windows} windows · ${state.workspace?.tabs} tabs`),
       el("p", "", `Last synced ${ago(state.lastSynced)} · ${state.queue} local changes queued`),
@@ -447,7 +490,25 @@ function settings() {
         "",
         "Active tabs and window positions stay local. Pausing disconnects Relay; workspace changes made while paused are queued for resume.",
       ),
-      el("h3", "divider", "What this device synchronizes"),
+    );
+  if (section === "Synchronization")
+    content.append(
+      el(
+        "p",
+        "section-intro",
+        "Choose which workspace changes this device shares with your other Relay devices.",
+      ),
+      el("h3", "section-label", "Tabs"),
+      preferenceRow("New tabs", "Add newly opened tabs to Relay.", "tabCreation"),
+      preferenceRow(
+        "Close tabs",
+        "Close synced tabs on your other devices.",
+        "tabClosure",
+        true,
+        "Coming later: local dismissal needs a durable per-device projection state.",
+      ),
+      preferenceRow("Navigation", "Keep synchronized tabs on the same URL.", "navigation"),
+      el("h3", "section-label divided-label", "Organization"),
       preferenceRow(
         "Tab groups",
         "Sync group names, colors, and tab membership.",
@@ -459,35 +520,38 @@ function settings() {
       ),
       preferenceRow("Pinned tabs", "Keep pinned and unpinned state synchronized.", "pinnedTabs"),
       preferenceRow(
-        "Navigation",
-        "Keep synchronized tabs on the same URL across devices.",
-        "navigation",
-      ),
-      preferenceRow(
-        "New tabs",
-        "Add tabs opened on this device to your Relay workspace.",
-        "tabCreation",
-      ),
-      preferenceRow(
-        "Close tabs",
-        "Close a Relay tab on your other devices when you close it here.",
-        "tabClosure",
-        true,
-        "Coming later: local dismissal needs a durable per-device projection state.",
-      ),
-      preferenceRow(
         "Multiple windows",
         "Recreate Relay's separate browser windows on this device.",
         "multipleWindows",
         true,
         "Coming later: flattening is deferred to protect window lifecycle reconciliation.",
       ),
+      el(
+        "div",
+        "sync-boundaries",
+        el(
+          "div",
+          "",
+          el("h3", "", "Always stays local"),
+          el("p", "", "Active tab, window focus, window size and position, group collapsed state."),
+        ),
+        el(
+          "div",
+          "",
+          el("h3", "", "Never synchronized"),
+          el("p", "", "Incognito, local files, and protected browser pages."),
+        ),
+      ),
     );
   if (section === "Devices") content = devicePanel();
   if (section === "Security") {
     content.append(
       el("h3", "divider", "Account number"),
-      el("div", "secret", revealed ? grouped(state.account ?? "") : masked(state.account ?? "")),
+      el(
+        "div",
+        "secret account-number",
+        revealed ? grouped(state.account ?? "") : masked(state.account ?? ""),
+      ),
       el(
         "div",
         "actions",
@@ -522,7 +586,7 @@ function settings() {
         state.server === state.official ? "Relay · Official service" : "Custom server",
       ),
       el("p", "", state.server),
-      el("div", "status", state.status),
+      statusBadge(state.status),
       el(
         "p",
         "divider",
@@ -561,28 +625,34 @@ function settings() {
     } else
       content.append(el("small", "", "A public source repository URL has not been configured."));
   }
-  if (state.diagnostics && section === "General")
-    content.append(
+  if (__DEV__ && section === "General") {
+    const development = el(
+      "details",
+      "development",
+      el("summary", "", "Development"),
+      el("h3", "", "Connection diagnostics"),
       el(
-        "details",
+        "p",
         "",
-        el("summary", "", "Development counters"),
+        "Inspect the local server connection and development-only synchronization details.",
+      ),
+      button("Test connection", () => void testConnection(), "secondary compact"),
+    );
+    if (state.diagnostics)
+      development.append(
         el(
           "p",
-          "",
+          "development-meta",
           `${state.diagnostics.operations} local operations · ${state.diagnostics.reconnects} connections · ${state.diagnostics.snapshotBytes} snapshot bytes · revision ${state.revision}`,
         ),
-      ),
-    );
-  if (state.behavior && section === "General")
-    content.append(
-      el(
-        "details",
-        "",
-        el("summary", "", "Local sync diagnostics"),
+      );
+    if (state.startTrace?.length) development.append(el("pre", "", state.startTrace.join("\n")));
+    if (state.behavior)
+      development.append(
         el("pre", "", JSON.stringify({ lifecycle: state.lifecycle, ...state.behavior }, null, 2)),
-      ),
-    );
+      );
+    content.append(development);
+  }
   return el("div", "grid", nav, content);
 }
 function render() {
@@ -591,27 +661,19 @@ function render() {
   // including after a settings-page reload, instead of offering Start syncing.
   if (state.phase === "draft" && !state.recovery && screen === "welcome") screen = "join";
   app.className = "shell";
+  app.classList.toggle("onboarding-shell", state.phase !== "active");
+  app.classList.toggle(
+    "onboarding-welcome-shell",
+    state.phase === "welcome" && screen === "welcome",
+  );
   app.replaceChildren(brand());
+  const page = state.phase === "active" ? settings() : onboarding();
   if (state.error) {
-    const error = el("p", "error", state.error);
-    error.id = "error";
-    app.append(error);
+    const errorTarget =
+      state.phase === "active" ? page.querySelector<HTMLElement>(".section") : page;
+    (errorTarget ?? page).prepend(errorMessage(state.error));
   }
-  if (state.phase === "active") app.append(settings());
-  else app.append(onboarding());
-  if (__DEV__) {
-    if ((state.phase === "draft" && state.recovery) || state.phase === "active")
-      app.append(button("Test connection", () => void testConnection()));
-    if (state.startTrace?.length)
-      app.append(
-        el(
-          "details",
-          "",
-          el("summary", "", "Development connection trace"),
-          el("pre", "", state.startTrace.join("\n")),
-        ),
-      );
-  }
+  app.append(page);
   app.append(
     el(
       "footer",
