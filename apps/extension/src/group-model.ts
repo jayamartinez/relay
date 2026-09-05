@@ -41,7 +41,11 @@ export function observeGroups(
 ) {
   if (!windows.some((w) => w.groups !== undefined)) return;
   next.groups = {};
-  next.collapsed = {};
+  // A browser-restored group is authoritative for its current physical state, but a
+  // temporarily missing group must not erase the device-local preference needed if
+  // reconciliation has to recreate it. Logical deletion is pruned separately once
+  // the synchronized workspace no longer contains the group.
+  next.collapsed = { ...previous.collapsed };
   next.observed.groups = {};
   const used = new Set<string>();
   for (const window of windows) {
@@ -76,6 +80,18 @@ export function observeGroups(
       next.observed.version = 2;
     }
   }
+}
+export function pruneCollapsedGroups(mapping: Mapping, workspace: Workspace) {
+  if (!mapping.collapsed) return;
+  for (const id of Object.keys(mapping.collapsed))
+    if (!workspace.groups[id]) delete mapping.collapsed[id];
+}
+export function updateCollapsedGroup(mapping: Mapping, local: number, collapsed: boolean): boolean {
+  const logical = mapping.groups?.[local];
+  if (!logical || mapping.collapsed?.[logical] === collapsed) return false;
+  mapping.collapsed ??= {};
+  mapping.collapsed[logical] = collapsed;
+  return true;
 }
 export function groupMutationValue(change: Extract<Change, { type: "group-create" }>) {
   return canonical({ type: change.type, group: groupStructure(change.group) });

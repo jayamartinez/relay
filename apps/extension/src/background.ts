@@ -84,8 +84,11 @@ if (groupsAvailable()) {
   chrome.tabGroups.onCreated.addListener(changed);
   chrome.tabGroups.onRemoved.addListener(changed);
   chrome.tabGroups.onMoved.addListener(changed);
-  // A collapsed-only event updates local observation, but produces no wire mutation.
-  chrome.tabGroups.onUpdated.addListener(changed);
+  chrome.tabGroups.onUpdated.addListener((group) => {
+    // Collapsed state is a per-device preference, persisted by logical Relay group ID.
+    void run(() => controller.groupUpdated(group.id, group.collapsed)).catch(() => {});
+    changed(); // Title and color still flow through normal canonical observation.
+  });
 }
 chrome.tabs.onMoved.addListener(changed);
 chrome.tabs.onAttached.addListener(changed);

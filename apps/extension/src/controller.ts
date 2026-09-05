@@ -71,6 +71,7 @@ import { BrowserEvents, type Lifecycle } from "./browser-events";
 import { diffWorkspace, type Mapping, navigationCircuit } from "./browser-model";
 import { diagnosticDevice, diagnosticSnapshot, trace } from "./diagnostics";
 import { groupsAvailable, groupsEnabled, requireGroupSupport } from "./group-browser";
+import { pruneCollapsedGroups, updateCollapsedGroup } from "./group-model";
 import { committedNavigation, expectNavigation, remoteNavigationEvent } from "./navigation";
 import {
   defaultSyncPreferences,
@@ -349,6 +350,10 @@ export class Controller {
       return;
     }
     this.events.removed(local, window, false);
+  }
+  async groupUpdated(local: number, collapsed: boolean) {
+    if (this.local && updateCollapsedGroup(this.local.mapping, local, collapsed))
+      await this.persist();
   }
   failure(error: unknown) {
     this.error = error instanceof Error ? error.message : "Relay could not complete this action.";
@@ -890,14 +895,7 @@ export class Controller {
   }
   private projected(): Workspace {
     const s = this.require();
-    let state = s.canonical;
-    for (const entry of s.queue)
-      state = applyOperation(
-        state,
-        { ...entry.operation, base: state.revision },
-        state.revision + 1,
-      );
-    state = structuredClone(state);
+    const state = structuredClone(this.synchronizedWorkspace());
     // Projection choices remain local; encrypted canonical workspace state is never rewritten.
     if (!this.preferences.tabGroups) state.groups = {};
     if (!this.preferences.navigation || !this.preferences.pinnedTabs)
@@ -911,6 +909,21 @@ export class Controller {
         if (!this.preferences.pinnedTabs) tab.pinned = observed.pinned;
       }
     return state;
+  }
+  private synchronizedWorkspace(): Workspace {
+    const s = this.require();
+    let state = s.canonical;
+    for (const entry of s.queue)
+      state = applyOperation(
+        state,
+        { ...entry.operation, base: state.revision },
+        state.revision + 1,
+      );
+    return state;
+  }
+  private pruneLocalGroupState() {
+    const s = this.require();
+    pruneCollapsedGroups(s.mapping, this.synchronizedWorkspace());
   }
   private allowedLocalChanges(changes: Change[]): Change[] {
     return changes.filter((change) => {
@@ -971,6 +984,7 @@ export class Controller {
         changes,
       },
     });
+    this.pruneLocalGroupState();
     s.diagnostics.operations++;
     const operation = s.queue.at(-1)!.operation;
     for (const change of changes) {
@@ -1176,6 +1190,7 @@ export class Controller {
     );
     s.canonical = canonicalState;
     s.queue = s.queue.filter((q) => q.sequence > reply.sequence);
+    this.pruneLocalGroupState();
     s.nextSequence = Math.max(s.nextSequence, reply.sequence + 1);
     assert(Array.isArray(reply.pending) && reply.pending.length <= LIMITS.pending);
     s.approvals = reply.pending.map(parsePair);
