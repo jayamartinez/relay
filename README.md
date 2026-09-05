@@ -6,7 +6,7 @@ Relay synchronizes browser tabs and windows between computers without a Google a
 
 Built for Helium. Works with compatible Chromium browsers.
 
-**Early v1 implementation · version 1.0.0 · working product name.** This is functional development software, not an audited or Chrome Web Store-approved release. Use disposable profiles for initial testing. No official hosted service is configured or claimed.
+**Version 1.0.0 · Alpha.** This is functional pre-release software, not an audited or Chrome Web Store-approved release. Use disposable profiles for initial testing. Production builds use the official Relay Worker at `https://relay.relay-sync.workers.dev`.
 
 ## What works
 
@@ -16,7 +16,7 @@ Built for Helium. Works with compatible Chromium browsers.
 - Local-only/protected tabs stay local and create no remote tab or placeholder.
 - Persisted encrypted local journal, canonical server revisions, checkpoint snapshots, reconnection and pause/resume.
 - Device revocation with a new workspace key, per-device key provisioning, and signed best-effort online wipe that leaves browser tabs open.
-- Vanilla TypeScript popup and settings/onboarding; no content scripts, remote fonts, UI framework, or runtime analytics.
+- Vanilla TypeScript popup and settings/onboarding; no content scripts, remote font requests, UI framework, or runtime analytics.
 - A local Cloudflare Worker with SQLite-backed Durable Objects and hibernating WebSockets.
 - Tab groups when the browser exposes the supported APIs: title/color, ordered membership, grouping/ungrouping and cross-window structure. Collapse stays local.
 
@@ -55,7 +55,7 @@ pnpm exec playwright install chromium
 pnpm test:e2e
 ```
 
-`pnpm build` produces the production extension and a dry-run Worker bundle. It does **not** deploy. The production extension intentionally rejects plaintext localhost servers; use `pnpm build:extension:dev` for local work. Building development and production currently replaces the same `dist` directory.
+`pnpm build` produces the production extension, configured for `https://relay.relay-sync.workers.dev`, and a dry-run Worker bundle. It does **not** deploy. Use `pnpm build:extension:dev` for local Wrangler and `pnpm build:extension:staging` for the separate staging Worker. Each build replaces the same `apps/extension/dist` directory.
 
 ## How it fits together
 

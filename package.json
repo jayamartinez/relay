@@ -16,7 +16,9 @@
     "test:e2e": "node scripts/build-extension.mjs --dev --diagnostics && playwright test",
     "test:google": "node scripts/build-extension.mjs --dev --diagnostics && playwright test --config playwright.google.config.ts",
     "build:extension:dev": "node scripts/build-extension.mjs --dev",
-    "build": "node scripts/build-extension.mjs && pnpm --filter @relay/server build && node scripts/audit-build.mjs",
+    "build:extension:staging": "node scripts/build-extension.mjs --channel=staging",
+    "build:extension:production": "node scripts/build-extension.mjs --channel=production",
+    "build": "pnpm build:extension:production && pnpm --filter @relay/server build && node scripts/audit-build.mjs",
     "lint": "biome check .",
     "format": "biome check --write .",
     "typecheck": "tsc -p tsconfig.json && tsc -p apps/server/tsconfig.json",
@@ -24,6 +26,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.12",
+    "@fontsource-variable/instrument-sans": "5.3.0",
     "@playwright/test": "1.62.1",
     "@types/chrome": "0.2.8",
     "@types/node": "22.19.0",

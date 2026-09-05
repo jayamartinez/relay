@@ -2,7 +2,7 @@
 
 import { adjacentApprovalId, approvalPosition, currentApproval, SingleFlight } from "./approval-ui";
 import type { Status } from "./controller";
-import { ago, brand, button, call, el, groupedCode, masked, statusBadge } from "./ui";
+import { ago, brand, button, call, countLabel, el, groupedCode, masked, statusBadge } from "./ui";
 
 const app = document.getElementById("app");
 const requests = new SingleFlight();
@@ -197,12 +197,12 @@ function render() {
         el(
           "p",
           "metric",
-          `${state.workspace?.windows ?? 0} windows · ${state.workspace?.tabs ?? 0} tabs`,
+          `${countLabel(state.workspace?.windows ?? 0, "window")} · ${countLabel(state.workspace?.tabs ?? 0, "tab")}`,
         ),
         el(
           "p",
           "popup-meta",
-          `${state.devices.filter((device) => device.online).length} devices connected · ${state.queue} queued`,
+          `${countLabel(state.devices.filter((device) => device.online).length, "device")} connected · ${countLabel(state.queue, "change")} queued`,
         ),
         el("small", "", `Last synced ${ago(state.lastSynced)}`),
       ),

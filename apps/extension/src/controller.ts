@@ -82,6 +82,7 @@ import * as vault from "./vault";
 import { initialMerge, restoreMapping } from "./workspace-lifecycle";
 
 declare const __DEV__: boolean;
+declare const __BUILD_CHANNEL__: "development" | "staging" | "production";
 declare const __OFFICIAL_ORIGIN__: string;
 const PAIR_REQUEST_LIFETIME_MS = 590_000;
 const APPROVAL_RESULT_LIFETIME_MS = 10_000;
@@ -1479,6 +1480,7 @@ export class Controller {
       error: this.error,
       server: s?.server ?? (__OFFICIAL_ORIGIN__ || (__DEV__ ? "http://localhost:8787" : "")),
       official: __OFFICIAL_ORIGIN__,
+      channel: __BUILD_CHANNEL__,
       groups: groupsAvailable()
         ? this.preferences.tabGroups
           ? "Tab groups available"

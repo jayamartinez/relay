@@ -7,7 +7,7 @@ import {
   recoverApprovalActivity,
   SingleFlight,
 } from "./approval-ui";
-import { groupedCode } from "./ui";
+import { countLabel, groupedCode } from "./ui";
 
 const now = 1_000_000;
 const approval = (id: string, expires = now + 60_000, sas = "419 882") => ({
@@ -20,6 +20,12 @@ const approval = (id: string, expires = now + 60_000, sas = "419 882") => ({
 });
 
 describe("popup device approvals", () => {
+  it("uses singular labels only for an exact count of one", () => {
+    expect(countLabel(0, "window")).toBe("0 windows");
+    expect(countLabel(1, "window")).toBe("1 window");
+    expect(countLabel(2, "tab")).toBe("2 tabs");
+    expect(countLabel(1, "local change")).toBe("1 local change");
+  });
   it("shows one current request with the canonical SAS and no redirect state", () => {
     const request = currentApproval([approval("one")], undefined, now);
     expect(request).toMatchObject({ id: "one", sas: "419 882", ours: true });
