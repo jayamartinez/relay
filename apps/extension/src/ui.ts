@@ -25,7 +25,7 @@ export function statusBadge(label: string) {
   const normalized = label.toLowerCase();
   badge.dataset.tone = /not connected|offline|disconnected/.test(normalized)
     ? "neutral"
-    : /pause|waiting|connecting/.test(normalized)
+    : /pause|waiting|connecting|needs attention/.test(normalized)
       ? "warning"
       : /live|online|connected/.test(normalized)
         ? "success"

@@ -58,6 +58,7 @@ import {
   text,
 } from "@relay/shared";
 import { Api, ApiError } from "./api";
+import { type ApprovalActivity, badgeText, recoverApprovalActivity } from "./approval-ui";
 import {
   browserWindows,
   capture,
@@ -82,6 +83,9 @@ import { initialMerge, restoreMapping } from "./workspace-lifecycle";
 
 declare const __DEV__: boolean;
 declare const __OFFICIAL_ORIGIN__: string;
+const PAIR_REQUEST_LIFETIME_MS = 590_000;
+const APPROVAL_RESULT_LIFETIME_MS = 10_000;
+export const APPROVAL_EXPIRY_ALARM = "relay-approval-expiry";
 interface QueueEntry {
   sequence: number;
   operation: Operation;
@@ -113,6 +117,7 @@ interface Local {
   request?: PairRequest;
   pairSecrets: Record<string, EphemeralState>;
   approvals: PairRequest[];
+  approvalActivity?: ApprovalActivity;
   presence: SyncReply["presence"];
   lastSynced: number;
   diagnostics: { operations: number; reconnects: number; snapshotBytes: number };
@@ -136,6 +141,7 @@ export class Controller {
   private loaded = false;
   private loadFailed = false;
   private lastCheckpoint = 0;
+  private lastApprovalRefresh = 0;
   private preferences: SyncPreferencesV1 = defaultSyncPreferences();
   private api(): Api {
     const s = this.require();
@@ -165,6 +171,75 @@ export class Controller {
   private auth<T>(action: string, payload: unknown) {
     return this.api().authenticated<T>(action, payload, this.require().device.id, this.key());
   }
+  private async updateApprovalBadge() {
+    await chrome.action.setBadgeText({ text: badgeText(this.local?.approvals ?? []) });
+    await chrome.action.setBadgeBackgroundColor({ color: "#4f6cff" });
+    const nextExpiry = this.local?.approvals
+      .filter((pair) => pair.expires > Date.now())
+      .sort((left, right) => left.expires - right.expires)[0]?.expires;
+    if (nextExpiry) await chrome.alarms.create(APPROVAL_EXPIRY_ALARM, { when: nextExpiry + 1 });
+    else await chrome.alarms.clear(APPROVAL_EXPIRY_ALARM);
+  }
+  private async pruneExpiredApprovals() {
+    const s = this.local;
+    if (!s) {
+      await this.updateApprovalBadge();
+      return;
+    }
+    let changed = false;
+    const valid = s.approvals.filter((pair) => pair.expires > Date.now());
+    if (
+      s.approvalActivity?.finishedAt &&
+      s.approvalActivity.finishedAt + APPROVAL_RESULT_LIFETIME_MS <= Date.now()
+    ) {
+      delete s.approvalActivity;
+      changed = true;
+    }
+    if (valid.length !== s.approvals.length) {
+      const activeIds = new Set(valid.map((pair) => pair.id));
+      for (const requestId of Object.keys(s.pairSecrets))
+        if (requestId !== s.request?.id && !activeIds.has(requestId)) {
+          delete s.pairSecrets[requestId];
+          await vault.remove(`ephemeral:${requestId}`);
+        }
+      if (
+        s.approvalActivity?.status === "working" &&
+        !activeIds.has(s.approvalActivity.requestId)
+      ) {
+        s.approvalActivity.status = "failed";
+        s.approvalActivity.finishedAt = Date.now();
+        s.approvalActivity.error = "Request expired.";
+      }
+      s.approvals = valid;
+      changed = true;
+    }
+    if (changed) await this.persist();
+    await this.updateApprovalBadge();
+  }
+  private reconcileApprovalActivity() {
+    const s = this.local;
+    const activity = s?.approvalActivity;
+    if (!s || !activity) return;
+    s.approvalActivity = recoverApprovalActivity(
+      activity,
+      new Set(s.approvals.map((pair) => pair.id)),
+      new Set(s.control?.members.map((device) => device.id)),
+    );
+  }
+  private approvalError(error: unknown, action: "approve" | "deny") {
+    if (error instanceof ApiError) {
+      if (error.status === 404 || error.status === 410) return "Request expired.";
+      if (error.status === 0) return "Relay server unavailable. Try again.";
+      if (/ALREADY|AUTHORIZED/.test(error.code)) return "Device is already authorized.";
+      if (/PROTOCOL|VERSION/.test(error.code)) return "Pairing protocol mismatch.";
+      if (/SIGNATURE|VERIFY|VALIDATION/.test(error.code)) return "Verification failed.";
+    }
+    const message = error instanceof Error ? error.message : "";
+    if (/expired/i.test(message)) return "Request expired.";
+    if (/no longer|unavailable/i.test(message)) return "Request no longer exists.";
+    if (/verification codes/i.test(message)) return "Verification failed. Compare the codes again.";
+    return action === "approve" ? "Could not approve device." : "Could not deny request.";
+  }
   // All public entry points run through background.ts's serial task queue.
   async load() {
     if (this.loaded) return;
@@ -186,6 +261,7 @@ export class Controller {
       diagnosticDevice(this.local.device.id);
       requireGroupSupport(this.local.canonical);
       if (this.local.control) this.local.control = parseControl(this.local.control);
+      await this.pruneExpiredApprovals();
       if (this.local.phase === "active") {
         await this.hydrate();
         if (!this.local.paused) await this.connect();
@@ -478,7 +554,7 @@ export class Controller {
       id: crypto.randomUUID(),
       device: s.device,
       commitment: pair.commitment,
-      expires: Date.now() + 590_000,
+      expires: Date.now() + PAIR_REQUEST_LIFETIME_MS,
     };
     const response = await this.api().post<unknown>("pair-start", {
       ...request,
@@ -567,31 +643,117 @@ export class Controller {
     const s = this.require();
     const pending = s.approvals.find((p) => p.id === requestId);
     assert(pending && !pending.offer, "Request is no longer available.");
-    const pair = await ephemeral();
-    s.pairSecrets[requestId] = {
-      reveal: pair.reveal,
-      commitment: pair.commitment,
-      request: pairStart(pending),
-    };
-    await vault.write(`ephemeral:${requestId}`, pair.privateKey);
-    await this.persist();
-    await this.auth("pair-offer", { id: requestId, commitment: pair.commitment });
+    let secret = s.pairSecrets[requestId];
+    if (!secret?.request) {
+      const pair = await ephemeral();
+      secret = {
+        reveal: pair.reveal,
+        commitment: pair.commitment,
+        request: pairStart(pending),
+      };
+      s.pairSecrets[requestId] = secret;
+      await vault.write(`ephemeral:${requestId}`, pair.privateKey);
+      await this.persist();
+    }
+    await this.auth("pair-offer", { id: requestId, commitment: secret.commitment });
     await this.pull();
     return this.status();
   }
   async approve(requestId: string, code: string) {
     const s = this.require();
+    if (
+      s.approvalActivity?.requestId === requestId &&
+      s.approvalActivity.action === "approve" &&
+      s.approvalActivity.status !== "failed"
+    )
+      return this.status();
     const pair = s.approvals.find((p) => p.id === requestId);
     assert(pair && pair.offer?.device.id === s.device.id && s.control);
-    assert(code === (await this.pairSas(pair, "approver")), "Verification codes do not match.");
-    const control = await this.addMember(pair.device, this.key(), s.device.id);
-    await this.auth("pair-approve", { id: requestId, control });
-    await this.pull();
-    return this.status();
+    s.approvalActivity = {
+      requestId,
+      deviceId: pair.device.id,
+      action: "approve",
+      status: "working",
+      startedAt: Date.now(),
+    };
+    await this.persist();
+    try {
+      assert(code === (await this.pairSas(pair, "approver")), "Verification codes do not match.");
+      const control = await this.addMember(pair.device, this.key(), s.device.id);
+      await this.auth("pair-approve", { id: requestId, control });
+      s.approvalActivity.status = "approved";
+      s.approvalActivity.finishedAt = Date.now();
+      await this.pull();
+      await this.persist();
+      return this.status();
+    } catch (error) {
+      s.approvalActivity.status = "failed";
+      s.approvalActivity.finishedAt = Date.now();
+      s.approvalActivity.error = this.approvalError(error, "approve");
+      await this.persist();
+      throw error;
+    }
   }
   async deny(requestId: string) {
-    await this.auth("pair-deny", { id: requestId });
-    await this.pull();
+    const s = this.require();
+    if (
+      s.approvalActivity?.requestId === requestId &&
+      s.approvalActivity.action === "deny" &&
+      s.approvalActivity.status !== "failed"
+    )
+      return this.status();
+    const pair = s.approvals.find((candidate) => candidate.id === requestId);
+    assert(pair, "Request is no longer available.");
+    s.approvalActivity = {
+      requestId,
+      deviceId: pair.device.id,
+      action: "deny",
+      status: "working",
+      startedAt: Date.now(),
+    };
+    await this.persist();
+    try {
+      await this.auth("pair-deny", { id: requestId });
+      s.approvalActivity.status = "denied";
+      s.approvalActivity.finishedAt = Date.now();
+      await this.pull();
+      await this.persist();
+      return this.status();
+    } catch (error) {
+      s.approvalActivity.status = "failed";
+      s.approvalActivity.finishedAt = Date.now();
+      s.approvalActivity.error = this.approvalError(error, "deny");
+      await this.persist();
+      throw error;
+    }
+  }
+  async refreshApprovals() {
+    const s = this.local;
+    try {
+      if (s?.phase === "active" && s.control && Date.now() - this.lastApprovalRefresh > 1_000)
+        await this.pull();
+      else await this.pruneExpiredApprovals();
+    } catch (error) {
+      if (s?.approvalActivity?.status === "working") {
+        s.approvalActivity.status = "failed";
+        s.approvalActivity.finishedAt = Date.now();
+        s.approvalActivity.error = this.approvalError(error, s.approvalActivity.action);
+        await this.persist();
+      }
+      throw error;
+    }
+    return this.status();
+  }
+  async dismissApprovalResult() {
+    const s = this.local;
+    if (s?.approvalActivity && s.approvalActivity.status !== "working") {
+      delete s.approvalActivity;
+      await this.persist();
+    }
+    return this.status();
+  }
+  async expireApprovals() {
+    await this.pruneExpiredApprovals();
     return this.status();
   }
   private async addMember(device: Device, key: CryptoKey, actor: string): Promise<Control> {
@@ -1016,6 +1178,7 @@ export class Controller {
     s.nextSequence = Math.max(s.nextSequence, reply.sequence + 1);
     assert(Array.isArray(reply.pending) && reply.pending.length <= LIMITS.pending);
     s.approvals = reply.pending.map(parsePair);
+    this.reconcileApprovalActivity();
     for (const requestId of Object.keys(s.pairSecrets))
       if (requestId !== s.request?.id && !s.approvals.some((p) => p.id === requestId)) {
         delete s.pairSecrets[requestId];
@@ -1037,9 +1200,8 @@ export class Controller {
     }
     s.presence = reply.presence;
     s.lastSynced = Date.now();
-    await chrome.action.setBadgeText({
-      text: s.approvals.length ? String(s.approvals.length) : "",
-    });
+    this.lastApprovalRefresh = Date.now();
+    await this.updateApprovalBadge();
     await this.persist();
     for (const pair of s.approvals) {
       if (pair.offer?.device.id === s.device.id && pair.requesterReveal && !pair.approverReveal) {
@@ -1287,6 +1449,7 @@ export class Controller {
   }
   async status() {
     const s = this.local;
+    await this.pruneExpiredApprovals();
     const stats = await workspaceStats();
     let sas: string | undefined;
     const approvals = [];
@@ -1304,6 +1467,7 @@ export class Controller {
       approvals.push({
         id: pair.id,
         expires: pair.expires,
+        requestedAt: pair.expires - PAIR_REQUEST_LIFETIME_MS,
         sas: code,
         reviewing: !!pair.offer,
         ours: pair.offer?.device.id === s?.device.id,
@@ -1349,6 +1513,14 @@ export class Controller {
           }
         : undefined,
       approvals,
+      approvalActivity: s?.approvalActivity
+        ? {
+            ...s.approvalActivity,
+            connected:
+              s.approvalActivity.action === "approve" &&
+              !!s.presence[s.approvalActivity.deviceId]?.online,
+          }
+        : undefined,
       devices:
         s?.control?.members.map((d) => ({
           id: d.id,
