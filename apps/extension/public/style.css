@@ -920,6 +920,79 @@ pre {
   min-height: 34px;
 }
 
+.popup-approval {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 18px 0;
+}
+
+.popup-approval h2 {
+  margin: 0;
+}
+
+.popup-request-meta {
+  margin: 3px 0 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.popup-code-label {
+  margin-top: 20px;
+}
+
+.popup .popup-code {
+  margin: 5px 0 9px;
+  font-size: 36px;
+}
+
+.popup-approval-copy {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.popup-preparing {
+  margin-top: 18px;
+}
+
+.popup-approval-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.popup-approval-actions .primary {
+  margin-left: auto;
+}
+
+.popup-request-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 14px -8px -8px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.popup-progress {
+  min-height: 154px;
+}
+
+.popup-progress .popup-approval-copy {
+  margin-top: 10px;
+}
+
+.popup-progress .popup-error {
+  margin: 14px 0 0;
+}
+
+.popup-error {
+  margin-bottom: 0;
+}
+
 .hidden {
   display: none;
 }

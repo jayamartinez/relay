@@ -1,8 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { Controller } from "./controller";
+import { APPROVAL_EXPIRY_ALARM, Controller } from "./controller";
 import { groupsAvailable } from "./group-browser";
 
 const controller = new Controller();
+const statusPorts = new Set<chrome.runtime.Port>();
+function broadcastStatusChanged() {
+  for (const port of statusPorts)
+    try {
+      port.postMessage({ type: "status-changed" });
+    } catch {
+      statusPorts.delete(port);
+    }
+}
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "relay-status" || port.sender?.id !== chrome.runtime.id) return;
+  statusPorts.add(port);
+  port.onDisconnect.addListener(() => statusPorts.delete(port));
+});
 let serial: Promise<unknown> = Promise.resolve();
 function run<T>(task: () => Promise<T>): Promise<T> {
   const next = serial.then(async () => {
@@ -13,10 +27,14 @@ function run<T>(task: () => Promise<T>): Promise<T> {
   return next;
 }
 controller.wake = () => {
-  void run(() => controller.reconnect()).catch(() => {});
+  void run(() => controller.reconnect())
+    .then(broadcastStatusChanged)
+    .catch(() => {});
 };
 controller.onSocketMessage = (data) => {
-  void run(() => controller.socketMessage(data)).catch(() => {});
+  void run(() => controller.socketMessage(data))
+    .then(broadcastStatusChanged)
+    .catch(() => {});
 };
 let debounce: ReturnType<typeof setTimeout> | undefined;
 function changed() {
@@ -89,6 +107,10 @@ chrome.runtime.onInstalled.addListener((details) => {
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "relay-reconnect") void run(() => controller.watchdog()).catch(() => {});
+  if (alarm.name === APPROVAL_EXPIRY_ALARM)
+    void run(() => controller.expireApprovals())
+      .then(broadcastStatusChanged)
+      .catch(() => {});
 });
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (
@@ -102,6 +124,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case "status":
         if (message.poll) await controller.pollPair();
         return controller.status();
+      case "refresh-approvals":
+        return controller.refreshApprovals();
       case "create":
         return controller.create(message.server, message.name);
       case "start":
@@ -116,6 +140,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return controller.approve(message.id, message.code);
       case "deny":
         return controller.deny(message.id);
+      case "dismiss-approval-result":
+        return controller.dismissApprovalResult();
       case "finish-pair":
         return controller.finishPair(message.code);
       case "recover":
@@ -138,7 +164,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         throw new Error("Unknown Relay action.");
     }
   }).then(
-    (value) => sendResponse({ ok: true, value }),
+    (value) => {
+      if (message.action !== "status") broadcastStatusChanged();
+      sendResponse({ ok: true, value });
+    },
     (error) =>
       sendResponse({
         ok: false,

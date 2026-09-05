@@ -694,6 +694,10 @@ async function refresh() {
     report(error);
   }
 }
+const statusPort = chrome.runtime.connect({ name: "relay-status" });
+statusPort.onMessage.addListener((message) => {
+  if (message?.type === "status-changed") void refresh();
+});
 void call("status")
   .then((value) => {
     state = value;
