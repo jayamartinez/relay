@@ -76,6 +76,8 @@ export async function call(
 export const masked = (account: string) => `•••• •••• •••• •••• •••• ${account.slice(-4)}`;
 export const grouped = (account: string) => account.match(/.{4}/g)?.join(" ") ?? account;
 export const groupedCode = (code: string) => code.replace(/\s/g, "").replace(/(.{3})(?=.)/, "$1 ");
+export const countLabel = (count: number, singular: string, plural = `${singular}s`) =>
+  `${count} ${count === 1 ? singular : plural}`;
 export function ago(timestamp: number | undefined) {
   if (!timestamp) return "Not yet";
   const minutes = Math.floor((Date.now() - timestamp) / 60_000);

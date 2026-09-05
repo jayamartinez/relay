@@ -6,6 +6,7 @@ import {
   brand,
   button,
   call,
+  countLabel,
   el,
   grouped,
   groupedCode,
@@ -108,7 +109,6 @@ function controls() {
         : "No official service is configured in this build. Use a self-hosted server.",
     ),
   );
-  if (__DEV__) detail.append(button("Test connection", () => void testConnection()));
   return el("div", "", name.wrapper, detail);
 }
 async function testConnection() {
@@ -202,7 +202,7 @@ function onboarding(): HTMLElement {
       el(
         "p",
         "",
-        `${state.stats.windows} windows · ${state.stats.tabs} syncable tabs · ${state.stats.local} local-only tabs`,
+        `${countLabel(state.stats.windows, "window")} · ${countLabel(state.stats.tabs, "syncable tab")} · ${countLabel(state.stats.local, "local-only tab")}`,
       ),
       confirmation(
         "I saved my recovery key and want to sync this workspace.",
@@ -261,12 +261,12 @@ function onboarding(): HTMLElement {
       el(
         "p",
         "",
-        `From Relay: ${state.workspace?.windows} windows · ${state.workspace?.tabs} tabs`,
+        `From Relay: ${countLabel(state.workspace?.windows ?? 0, "window")} · ${countLabel(state.workspace?.tabs ?? 0, "tab")}`,
       ),
       el(
         "p",
         "",
-        `Already open here: ${state.stats.windows} windows · ${state.stats.tabs} syncable tabs`,
+        `Already open here: ${countLabel(state.stats.windows, "window")} · ${countLabel(state.stats.tabs, "syncable tab")}`,
       ),
       el(
         "p",
@@ -457,6 +457,28 @@ function preferenceRow(
   );
   return row;
 }
+function serverPresentation() {
+  const hosted = !!state.official && state.server === state.official;
+  if (hosted && state.channel === "production")
+    return { name: "Relay server", description: "Official Relay service" };
+  if (hosted)
+    return {
+      name: "Relay staging server",
+      description: "Staging service for release validation",
+    };
+  if (
+    state.channel === "development" &&
+    /^http:\/\/(localhost|127\.0\.0\.1)(:|$)/.test(state.server)
+  )
+    return {
+      name: "Development server",
+      description: "Local Relay service for development",
+    };
+  return {
+    name: "Custom / self-hosted server",
+    description: "This browser profile is connected to a non-production Relay origin.",
+  };
+}
 function settings() {
   const nav = el("nav", "nav");
   nav.setAttribute("aria-label", "Settings");
@@ -473,8 +495,16 @@ function settings() {
     content.append(
       statusBadge(state.status),
       el("h3", "divider", "Main workspace"),
-      el("p", "metric", `${state.workspace?.windows} windows · ${state.workspace?.tabs} tabs`),
-      el("p", "", `Last synced ${ago(state.lastSynced)} · ${state.queue} local changes queued`),
+      el(
+        "p",
+        "metric",
+        `${countLabel(state.workspace?.windows ?? 0, "window")} · ${countLabel(state.workspace?.tabs ?? 0, "tab")}`,
+      ),
+      el(
+        "p",
+        "",
+        `Last synced ${ago(state.lastSynced)} · ${countLabel(state.queue, "local change")} queued`,
+      ),
       el(
         "div",
         "actions",
@@ -578,14 +608,12 @@ function settings() {
       ),
     );
   }
-  if (section === "Server")
+  if (section === "Server") {
+    const service = serverPresentation();
     content.append(
-      el(
-        "h3",
-        "divider",
-        state.server === state.official ? "Relay · Official service" : "Custom server",
-      ),
-      el("p", "", state.server),
+      el("h3", "divider", service.name),
+      el("p", "server-kind", service.description),
+      el("p", "server-origin", state.server),
       statusBadge(state.status),
       el(
         "p",
@@ -593,37 +621,45 @@ function settings() {
         "Accounts and encrypted workspaces belong to one server. Changing servers is not an account migration. Use a separate browser profile for another server; this build locks the origin after setup to avoid mixing account state.",
       ),
     );
+  }
   if (section === "About") {
     content.append(
       brand(),
-      el("p", "", "Relay 1.0.0 · Early v1 development build"),
-      el("p", "", state.groups),
+      el("p", "about-version", "Version 1.0.0 · Alpha"),
+      el(
+        "p",
+        "about-lede",
+        "Private workspace synchronization for Helium and compatible Chromium browsers.",
+      ),
+      el(
+        "p",
+        "",
+        "Relay keeps your tabs, windows, groups, and navigation synchronized across your devices with end-to-end encryption.",
+      ),
+      el("h3", "section-label divided-label", "Privacy"),
+      el(
+        "p",
+        "",
+        "Your workspace is encrypted on your devices before it reaches Relay. The Relay service cannot read synchronized URLs, tab-group titles, device names, or workspace contents. Webpage titles are not collected.",
+      ),
+      el("h3", "section-label divided-label", "Open source"),
+      el("p", "", "AGPL-3.0-or-later"),
+    );
+    const link = el("a", "source-link", "View source on GitHub ↗");
+    link.href = __REPOSITORY_URL__;
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    content.append(
+      link,
+      el("h3", "section-label divided-label", "Compatibility"),
       el("p", "", "Built for Helium. Works with compatible Chromium browsers."),
+      el("h3", "section-label divided-label", "Disclaimer"),
       el(
         "p",
         "",
         "Relay is an independent project and is not affiliated with or endorsed by Helium.",
       ),
-      el(
-        "p",
-        "",
-        "Source code: AGPL-3.0-or-later. Relay is a working product name. Security review and cross-platform manual testing are required before public release.",
-      ),
-      el("h3", "divider", "Privacy"),
-      el(
-        "p",
-        "",
-        "No telemetry, ads, browsing analytics, or sale of data. The server sees public keys, opaque IDs, connection metadata and ciphertext—not readable URLs, device names, recovery keys or workspace keys.",
-      ),
     );
-    if (__REPOSITORY_URL__) {
-      const link = el("a", "", "Source and documentation ↗");
-      link.href = __REPOSITORY_URL__;
-      link.target = "_blank";
-      link.rel = "noreferrer";
-      content.append(link);
-    } else
-      content.append(el("small", "", "A public source repository URL has not been configured."));
   }
   if (__DEV__ && section === "General") {
     const development = el(

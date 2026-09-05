@@ -1,3 +1,11 @@
+@font-face {
+  font-family: "Instrument Sans Variable";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("instrument-sans-latin-wght-normal.woff2") format("woff2-variations");
+}
+
 :root {
   color-scheme: dark;
   --hi-bg: #080c1d;
@@ -5,15 +13,16 @@
   --hi-surface: #121932;
   --hi-surface-raised: #182142;
   --hi-border: #252f52;
-  --hi-text: #f4f7ff;
-  --hi-text-soft: #b2bcd8;
-  --hi-text-muted: #7f8aaa;
+  --hi-text: #e3e6f2;
+  --hi-text-soft: #aab4d6;
+  --hi-text-muted: #8994b5;
   --hi-primary: #4f6cff;
   --hi-primary-hi: #6d84ff;
   --hi-haze: #273d91;
   --hi-success: #74d6a5;
   --hi-danger: #ff6f91;
-  --hi-font-sans: Inter, Geist, ui-sans-serif, system-ui, sans-serif;
+  --hi-font-sans:
+    "Instrument Sans Variable", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --hi-radius-sm: 0.5rem;
   --hi-radius-md: 0.75rem;
   --hi-radius-lg: 0.875rem;
@@ -41,8 +50,10 @@
   --radius-control: var(--hi-radius-sm);
   --radius-surface: var(--hi-radius-md);
   font-family: var(--font-sans);
-  font-size: 15px;
-  line-height: 1.55;
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
   color: var(--text-primary);
   background: var(--page-background);
 }
@@ -62,7 +73,8 @@ body {
     radial-gradient(55rem 34rem at 52% -18rem, rgb(48 70 164 / 32%), transparent 72%),
     var(--page-background);
   font-family: var(--font-sans);
-  font-size: 15px;
+  font-size: 16px;
+  font-weight: 500;
 }
 
 body :where(*) {
@@ -97,7 +109,8 @@ button {
   border-radius: var(--hi-radius-pill);
   background: var(--surface-elevated);
   color: var(--text-primary);
-  font: 600 13px / 1 var(--font-sans);
+  font: 500 14px / 1.2 var(--font-sans);
+  letter-spacing: -0.01em;
   cursor: pointer;
   transition:
     background-color 150ms ease,
@@ -151,7 +164,7 @@ button:disabled {
 .compact {
   min-height: 36px;
   padding: 8px 14px;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .danger {
@@ -177,7 +190,7 @@ a:hover {
 label {
   display: block;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 500;
 }
 
@@ -236,7 +249,7 @@ h1 {
   max-width: 16ch;
   margin-bottom: 18px;
   font-size: clamp(36px, 4.4vw, 56px);
-  font-weight: 560;
+  font-weight: 500;
   line-height: 1.04;
   letter-spacing: -0.04em;
 }
@@ -244,30 +257,32 @@ h1 {
 h2 {
   margin-bottom: 10px;
   font-size: 24px;
-  font-weight: 560;
-  line-height: 1.12;
-  letter-spacing: -0.025em;
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
 }
 
 h3 {
   margin-bottom: 4px;
-  font-size: 14px;
-  font-weight: 550;
+  font-size: 15px;
+  font-weight: 500;
   line-height: 1.35;
 }
 
 p {
   color: var(--text-secondary);
-  font-size: 15px;
-  font-weight: 400;
-  line-height: 1.6;
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
 }
 
 small {
   color: var(--text-tertiary);
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 1.5;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.45;
+  letter-spacing: -0.005em;
 }
 
 .brand {
@@ -279,9 +294,9 @@ small {
 
 .brand-word {
   font-size: 24px;
-  font-weight: 600;
+  font-weight: 500;
   line-height: 1;
-  letter-spacing: -0.045em;
+  letter-spacing: -0.035em;
 }
 
 .shell {
@@ -368,9 +383,10 @@ small {
 .section-label {
   margin: 0 0 15px;
   color: #93a3d2;
-  font-size: 11px;
-  font-weight: 550;
-  letter-spacing: 0.08em;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.3;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
@@ -434,8 +450,8 @@ small {
   align-items: center;
   gap: 8px;
   color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 650;
+  font-size: 13px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
@@ -511,7 +527,7 @@ small {
   background: transparent;
   color: var(--text-tertiary);
   text-align: left;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 500;
   justify-content: flex-start;
 }
@@ -589,7 +605,7 @@ small {
 
 .device-row h3,
 .preference-copy h3 {
-  font-weight: 520;
+  font-weight: 500;
 }
 
 .switch {
@@ -663,14 +679,15 @@ small {
 .sync-boundaries p {
   margin: 0;
   color: var(--text-tertiary);
-  font-size: 12px;
+  font-size: 14px;
+  font-weight: 500;
 }
 
 .metric {
   margin-bottom: 6px;
   color: var(--text-primary);
   font-size: clamp(24px, 4vw, 30px);
-  font-weight: 560;
+  font-weight: 500;
   line-height: 1.25;
   letter-spacing: -0.035em;
 }
@@ -681,6 +698,32 @@ small {
 
 .device-meta {
   color: var(--text-secondary);
+}
+
+.server-kind,
+.about-version {
+  margin-bottom: 4px;
+  color: var(--text-tertiary);
+  font-size: 14px;
+}
+
+.server-origin {
+  margin-bottom: 12px;
+  color: var(--text-secondary);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.about-lede {
+  max-width: 50ch;
+  font-size: 18px;
+  line-height: 1.45;
+}
+
+.source-link {
+  display: inline-flex;
+  font-size: 15px;
+  font-weight: 500;
 }
 
 .banner {
@@ -807,12 +850,16 @@ pre {
   border-top: 1px solid var(--border);
   padding-top: 20px;
   color: var(--text-tertiary);
-  font-size: 12px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.45;
 }
 
 .popup {
   width: 340px;
   min-height: 0;
+  overflow: hidden;
+  border-radius: var(--radius-surface);
   background:
     radial-gradient(24rem 15rem at 46% -9rem, rgb(54 82 220 / 24%), transparent 72%),
     var(--page-background);
@@ -820,7 +867,13 @@ pre {
 
 .popup main {
   width: 340px;
+  border-radius: inherit;
   padding: 20px;
+}
+
+.popup p {
+  font-size: 14px;
+  line-height: 1.45;
 }
 
 .popup-header {
@@ -839,7 +892,7 @@ pre {
   max-width: 15ch;
   margin-bottom: 9px;
   font-size: 20px;
-  font-weight: 560;
+  font-weight: 500;
 }
 
 .popup h2 {
@@ -853,7 +906,7 @@ pre {
 .popup .metric {
   margin-bottom: 6px;
   font-size: 25px;
-  font-weight: 560;
+  font-weight: 500;
 }
 
 .popup-workspace {
@@ -864,12 +917,15 @@ pre {
 .popup-meta {
   margin-bottom: 4px;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.45;
 }
 
 .popup .footer {
   margin-top: 16px;
   padding-top: 14px;
+  font-size: 12px;
 }
 
 .popup-actions {
@@ -890,7 +946,8 @@ pre {
   gap: 14px;
   padding: 10px 0;
   color: var(--text-tertiary);
-  font-size: 12px;
+  font-size: 13px;
+  font-weight: 500;
 }
 
 .popup-account small {
@@ -933,7 +990,8 @@ pre {
 .popup-request-meta {
   margin: 3px 0 0;
   color: var(--text-tertiary);
-  font-size: 12px;
+  font-size: 13px;
+  font-weight: 500;
 }
 
 .popup-code-label {
@@ -948,8 +1006,9 @@ pre {
 .popup-approval-copy {
   margin: 0;
   color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.45;
 }
 
 .popup-preparing {

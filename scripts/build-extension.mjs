@@ -6,15 +6,29 @@ import { build, context } from "esbuild";
 
 const dev = process.argv.includes("--dev");
 const watch = process.argv.includes("--watch");
+const requestedChannel = process.argv
+  .find((argument) => argument.startsWith("--channel="))
+  ?.split("=")[1];
+const channel = dev ? "development" : (requestedChannel ?? "production");
+if (!["development", "staging", "production"].includes(channel))
+  throw new Error(`Unknown Relay build channel: ${channel}`);
+if (dev && requestedChannel && requestedChannel !== "development")
+  throw new Error("Development builds cannot target a hosted Relay channel");
 const groups = true;
 const disableGroupsForDevelopment = dev && process.env.RELAY_DISABLE_TAB_GROUPS === "1";
 // Chrome match patterns cannot express private-IP CIDR ranges. This declaration is
 // only a development permission *ceiling*; settings validates private origins and
 // asks Chrome for the one exact origin entered by the user.
 const developmentOrigins = ["http://*/*"];
+const developmentLoopbackOrigins = ["http://localhost/*", "http://127.0.0.1/*", "http://[::1]/*"];
 const out = new URL("../apps/extension/dist/", import.meta.url);
 await mkdir(out, { recursive: true });
-let official = process.env.RELAY_OFFICIAL_ORIGIN ?? "";
+const hostedOrigins = {
+  development: "",
+  staging: "https://relay-staging.relay-sync.workers.dev",
+  production: "https://relay.relay-sync.workers.dev",
+};
+let official = process.env.RELAY_OFFICIAL_ORIGIN || hostedOrigins[channel];
 if (official) {
   const url = new URL(official);
   if (
@@ -29,7 +43,7 @@ if (official) {
     throw new Error("Official server must be an HTTPS origin without credentials or a path");
   official = url.origin;
 }
-const repository = process.env.RELAY_REPOSITORY_URL ?? "";
+const repository = process.env.RELAY_REPOSITORY_URL || "https://github.com/jayamartinez/relay";
 if (repository) {
   const url = new URL(repository);
   if (url.protocol !== "https:" || url.username || url.password)
@@ -44,7 +58,10 @@ const manifest = {
   minimum_chrome_version: "120",
   incognito: "not_allowed",
   permissions: ["tabs", "storage", "alarms", "webNavigation", "tabGroups"],
-  host_permissions: [...(official ? [`${new URL(official).origin}/*`] : [])],
+  host_permissions: [
+    ...(official ? [`${new URL(official).origin}/*`] : []),
+    ...(dev ? developmentLoopbackOrigins : []),
+  ],
   optional_host_permissions: ["https://*/*", ...(dev ? developmentOrigins : [])],
   background: { service_worker: "background.js", type: "module" },
   action: { default_popup: "popup.html", default_title: "Relay" },
@@ -64,6 +81,17 @@ for (const file of await readdir(new URL("../apps/extension/public/", import.met
       new URL(`../apps/extension/public/${file}`, import.meta.url),
       new URL(file, out),
     );
+await copyFile(
+  new URL(
+    "../node_modules/@fontsource-variable/instrument-sans/files/instrument-sans-latin-wght-normal.woff2",
+    import.meta.url,
+  ),
+  new URL("instrument-sans-latin-wght-normal.woff2", out),
+);
+await copyFile(
+  new URL("../node_modules/@fontsource-variable/instrument-sans/LICENSE", import.meta.url),
+  new URL("instrument-sans-LICENSE.txt", out),
+);
 await unlink(new URL("page.html", out)).catch((error) => {
   if (error.code !== "ENOENT") throw error;
 });
@@ -148,8 +176,9 @@ const options = {
       dev && (process.env.RELAY_DIAGNOSTICS === "1" || process.argv.includes("--diagnostics")),
     ),
     __DISABLE_TAB_GROUPS_FOR_DEVELOPMENT__: JSON.stringify(disableGroupsForDevelopment),
+    __BUILD_CHANNEL__: JSON.stringify(channel),
     __OFFICIAL_ORIGIN__: JSON.stringify(official),
-    __REPOSITORY_URL__: JSON.stringify(process.env.RELAY_REPOSITORY_URL ?? ""),
+    __REPOSITORY_URL__: JSON.stringify(repository),
   },
   tsconfig: "tsconfig.json",
   logLevel: "info",
