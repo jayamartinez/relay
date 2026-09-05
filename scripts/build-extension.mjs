@@ -67,7 +67,7 @@ for (const file of await readdir(new URL("../apps/extension/public/", import.met
 await unlink(new URL("page.html", out)).catch((error) => {
   if (error.code !== "ENOENT") throw error;
 });
-for (const stale of ["placeholder.html", "placeholder.js", "placeholder.js.map"])
+for (const stale of ["mark.svg", "placeholder.html", "placeholder.js", "placeholder.js.map"])
   await unlink(new URL(stale, out)).catch((error) => {
     if (error.code !== "ENOENT") throw error;
   });
