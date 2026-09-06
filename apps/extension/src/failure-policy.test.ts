@@ -17,6 +17,10 @@ describe("controller failure policy", () => {
       category: "NETWORK",
       disposition: "transient",
     });
+    expect(failurePolicy(new ChallengeValidationError("EXPIRED"))).toMatchObject({
+      category: "CHALLENGE_EXPIRED",
+      disposition: "transient",
+    });
   });
 
   it("does not weaken protocol, cryptographic, or unknown failures", () => {

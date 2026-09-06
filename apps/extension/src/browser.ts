@@ -4,6 +4,7 @@ import { classifyTab, isWeb, syncableTab } from "@relay/shared";
 import type { BrowserBatch } from "./browser-events";
 import {
   authorizedChanges,
+  browserWorkspace,
   diffWorkspace,
   expectation,
   type Mapping,
@@ -102,6 +103,9 @@ export async function capture(
       current.url = prior.url;
     }
   }
+  const logicalTabs = new Map(
+    Object.entries(result.mapping.tabs).map(([local, logical]) => [logical, Number(local)]),
+  );
   const changes = authorizedChanges(
     diffWorkspace(mapping.observed, result.workspace),
     mapping,
@@ -119,9 +123,7 @@ export async function capture(
     .filter((change) => {
       if (change.type !== "tab-navigate") return true;
       trace("USER", "TAB_NAVIGATE", "DETECTED", change.id);
-      const local = Number(
-        Object.entries(result.mapping.tabs).find(([, id]) => id === change.id)?.[0],
-      );
+      const local = logicalTabs.get(change.id)!;
       const receipt = seed.navigation?.[change.id];
       const duplicate =
         canonical.tabs[change.id] &&
@@ -174,7 +176,7 @@ export async function reconcile(
   persist: (mapping: Mapping) => Promise<void>,
   allowed: () => boolean = () => true,
 ): Promise<Mapping> {
-  target = replicatedWorkspace(target);
+  target = browserWorkspace(replicatedWorkspace(target));
   requireGroupSupport(target);
   const next = structuredClone(mapping);
   const operationId = crypto.randomUUID();
@@ -185,6 +187,11 @@ export async function reconcile(
   await persist(next);
   const actual = await browserWindows();
   if (!actual.length || !allowed()) throw new BrowserRuntimeRaceError();
+  const current = observe(actual, next, await sessionId(), source, ownOrigin());
+  if (diffWorkspace(current.workspace, target).length === 0) {
+    await persist(current.mapping);
+    return current.mapping;
+  }
   next.collapsed ??= {};
   for (const window of actual)
     for (const group of window.groups ?? []) {
@@ -232,8 +239,7 @@ export async function reconcile(
     for (const tab of desired) {
       if (!allowed()) throw new BrowserRuntimeRaceError();
       let localTab = localTabs.get(tab.id);
-      let live =
-        localTab === undefined ? undefined : await chrome.tabs.get(localTab).catch(() => undefined);
+      let live = localTab === undefined ? undefined : await chrome.tabs.get(localTab);
       if (!live) {
         const current = await windowTabs(local);
         const created: chrome.tabs.Tab = await chrome.tabs.create({
@@ -272,9 +278,14 @@ export async function reconcile(
     }
   }
   for (const [localText, logical] of Object.entries(next.tabs)) {
+    if (!allowed()) throw new BrowserRuntimeRaceError();
     if (target.tabs[logical]) continue;
     const local = Number(localText);
-    const live = actualTabs.get(local);
+    // Re-read identity at the destructive boundary. The initial snapshot can be
+    // stale after hundreds of awaited API calls or a navigation during apply.
+    const liveTab = actualTabs.has(local) ? await chrome.tabs.get(local) : undefined;
+    if (!allowed()) throw new BrowserRuntimeRaceError();
+    const live = liveTab ? observedTab(liveTab) : undefined;
     const previous = mapping.observed.tabs[logical];
     // Never close an untracked, incognito, or identity-mismatched tab.
     if (live && previous && !live.incognito) {
@@ -301,7 +312,7 @@ export async function reconcile(
   for (const key of Object.keys(next.navigation ?? {}))
     if (!target.tabs[key]) delete next.navigation![key];
   // No windows.remove: it could close unrelated local/extension tabs. Chrome closes an emptied window.
-  await reconcileGroups(target, next, persist);
+  await reconcileGroups(target, next, persist, allowed);
   next.observed = target;
   const observed = observe(await browserWindows(), next, await sessionId(), source, ownOrigin());
   await persist(observed.mapping);

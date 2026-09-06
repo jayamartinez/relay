@@ -68,7 +68,7 @@ import {
   workspaceStats,
 } from "./browser";
 import { BrowserEvents, type Lifecycle } from "./browser-events";
-import { diffWorkspace, type Mapping, navigationCircuit } from "./browser-model";
+import { browserWorkspace, diffWorkspace, type Mapping, navigationCircuit } from "./browser-model";
 import { asBrowserRuntimeRace } from "./browser-runtime";
 import { diagnosticDevice, diagnosticSnapshot, trace } from "./diagnostics";
 import { type FailureDisposition, failurePolicy } from "./failure-policy";
@@ -83,7 +83,7 @@ import {
 } from "./preferences";
 import { RemoteChangeTracker } from "./remote-change-tracker";
 import { settleBrowserRestore } from "./restore-settling";
-import { socketNeedsReconnect } from "./socket-lifecycle";
+import { reconnectDelay, SOCKET_STABLE_MS, socketNeedsReconnect } from "./socket-lifecycle";
 import * as vault from "./vault";
 import { initialMerge, restoreMapping } from "./workspace-lifecycle";
 
@@ -140,6 +140,8 @@ export class Controller {
   private heartbeat?: ReturnType<typeof setInterval>;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectAttempt = 0;
+  private reconnectAt = 0;
+  private socketOpenedAt = 0;
   private lastSocketMessage = 0;
   private socketStartedAt = 0;
   private remoteChanges = new RemoteChangeTracker();
@@ -155,12 +157,28 @@ export class Controller {
   private lastErrorDisposition: "none" | FailureDisposition = "none";
   private loaded = false;
   private loadFailed = false;
+  private persistedState?: string;
+  private storageWrites = 0;
+  private serverRequests = 0;
+  private lastTransientError = "NONE";
+  private lastFatalError = "NONE";
+  pendingTasks: () => number = () => 0;
+  get browserWorkPending() {
+    return this.lifecycle === "LIVE" && !this.halted && this.events.readyAt > 0;
+  }
   private lastCheckpoint = 0;
   private lastApprovalRefresh = 0;
   private preferences: SyncPreferencesV1 = defaultSyncPreferences();
   private api(): Api {
     const s = this.require();
-    return new Api(s.server, s.handle, (event) => this.recordStartTrace(event));
+    return new Api(
+      s.server,
+      s.handle,
+      (event) => this.recordStartTrace(event),
+      () => {
+        this.serverRequests++;
+      },
+    );
   }
   private recordStartTrace(event: string) {
     if (!__DEV__) return;
@@ -180,8 +198,14 @@ export class Controller {
     assert(root, "Workspace key is unavailable.");
     return unbase64(root);
   }
-  private persist() {
-    return vault.saveState(this.require());
+  private async persist() {
+    const state = JSON.stringify(this.require());
+    if (state === this.persistedState) return;
+    // Snapshot before the first await; browser callbacks can update receipts while
+    // encryption/storage is in flight. Never acknowledge data we did not save.
+    await vault.saveState(JSON.parse(state));
+    this.persistedState = state;
+    this.storageWrites++;
   }
   private auth<T>(action: string, payload: unknown) {
     return this.api().authenticated<T>(action, payload, this.require().device.id, this.key());
@@ -282,6 +306,18 @@ export class Controller {
         if (!this.local.paused) await this.connect();
       }
     } catch (error) {
+      if (
+        failurePolicy(error).category === "STORAGE_INTERRUPTED" &&
+        this.lifecycle === "LOADING_LOCAL_STATE"
+      ) {
+        this.loaded = false;
+        // Retry the complete authenticated local load; partial identity is unusable.
+        this.local = undefined;
+        this.signing = undefined;
+        this.exchange = undefined;
+        await chrome.alarms.create("relay-reconnect", { when: Date.now() + 30_000 });
+        throw error;
+      }
       if (!this.local) this.loadFailed = true;
       this.failure(error);
     }
@@ -339,6 +375,7 @@ export class Controller {
         return;
       }
       const localTarget = this.projected();
+      const adoptedGeneration = this.events.generation;
       const adopted = restoreMapping(
         actual,
         this.restoreCandidate ?? s.mapping,
@@ -355,7 +392,7 @@ export class Controller {
       await this.persist();
       // Native restoration and explicitly attributed startup actions are now adopted.
       // Events arriving after this point belong to ordinary browser use during the pull.
-      this.events.clear();
+      if (this.events.generation === adoptedGeneration) this.events.clear();
       this.clearStartupTracking();
     } else {
       actual = await browserWindows();
@@ -409,7 +446,8 @@ export class Controller {
       this.lifecycle = "LIVE";
       return;
     }
-    this.events.clear(); // Reconciliation observed the final browser state, including startup events.
+    // Keep events received during awaited browser mutations. Expected-operation
+    // suppression consumes our callbacks; later user commits still need capture.
     this.lifecycle = "LIVE";
     await this.persist();
     if (this.remoteChanges.dirty) await this.flush();
@@ -470,11 +508,13 @@ export class Controller {
         : "Relay could not complete this action.";
     this.lastErrorCategory = policy.category;
     this.lastErrorDisposition = policy.disposition;
+    if (policy.disposition === "transient") this.lastTransientError = policy.category;
+    if (policy.disposition === "fatal") this.lastFatalError = policy.category;
     if (policy.category === "NETWORK") {
       this.network = "Offline";
       this.disconnect();
       this.scheduleReconnect();
-    } else if (policy.browserRace) {
+    } else if (policy.disposition === "transient") {
       if (this.socket?.readyState !== WebSocket.OPEN) this.network = "Recovering";
       this.scheduleReconnect();
     } else if (policy.disposition === "action-required") {
@@ -1018,7 +1058,7 @@ export class Controller {
         }
         if (!this.preferences.pinnedTabs) tab.pinned = observed.pinned;
       }
-    return state;
+    return browserWorkspace(state);
   }
   private synchronizedWorkspace(): Workspace {
     const s = this.require();
@@ -1097,13 +1137,16 @@ export class Controller {
     this.pruneLocalGroupState();
     s.diagnostics.operations++;
     const operation = s.queue.at(-1)!.operation;
+    const localTabs = new Map(
+      Object.entries(s.mapping.tabs).map(([local, logical]) => [logical, Number(local)]),
+    );
     for (const change of changes) {
       if (change.type === "tab-navigate" || change.type === "tab-create") {
         const logical = change.type === "tab-create" ? change.tab.id : change.id;
         const tab = s.mapping.observed.tabs[logical];
-        const local = Object.entries(s.mapping.tabs).find(([, id]) => id === logical)?.[0];
-        if (tab && local)
-          expectNavigation(s.mapping, tab, Number(local), undefined, operation.id, "USER");
+        const local = localTabs.get(logical);
+        if (tab && local !== undefined)
+          expectNavigation(s.mapping, tab, local, undefined, operation.id, "USER");
       }
       trace(
         source,
@@ -1125,7 +1168,13 @@ export class Controller {
     requireGroupSupport(s.canonical);
     const evidence = this.events.take();
     if (!evidence) return false;
-    const result = await capture(s.mapping, s.device.id, evidence, this.projected());
+    let result: Awaited<ReturnType<typeof capture>>;
+    try {
+      result = await capture(s.mapping, s.device.id, evidence, this.projected());
+    } catch (error) {
+      this.events.restore(evidence);
+      throw error;
+    }
     if (result.shutdown) {
       await this.stopped();
       return false;
@@ -1157,8 +1206,10 @@ export class Controller {
       return;
     }
     const changed = await this.captureLocal();
+    if (this.reconnectAt > Date.now() && this.socket?.readyState !== WebSocket.OPEN) return;
     if (
       (changed ||
+        this.remoteChanges.dirty ||
         this.local?.intent ||
         (this.local && diffWorkspace(this.local.mapping.observed, this.projected()).length > 0)) &&
       this.local &&
@@ -1174,9 +1225,11 @@ export class Controller {
     if (this.events.closing || this.lifecycle === "STOPPED") return;
     if (!s.intent && diffWorkspace(s.mapping.observed, target).length === 0) return;
     s.intent = target;
+    const occupied = new Set(Object.values(target.tabs).map((tab) => tab.window));
+    for (const [local, expires] of this.remoteWindowCloses)
+      if (expires <= Date.now()) this.remoteWindowCloses.delete(local);
     for (const [local, logical] of Object.entries(s.mapping.windows))
-      if (!Object.values(target.tabs).some((t) => t.window === logical))
-        this.remoteWindowCloses.set(Number(local), Date.now() + 15_000);
+      if (!occupied.has(logical)) this.remoteWindowCloses.set(Number(local), Date.now() + 15_000);
     const previousLifecycle = this.lifecycle;
     this.lifecycle = "RECONCILING";
     await this.persist();
@@ -1463,11 +1516,17 @@ export class Controller {
   private disconnect() {
     clearInterval(this.heartbeat);
     clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    this.reconnectAt = 0;
+    this.socketOpenedAt = 0;
     this.heartbeat = undefined;
     this.socketStartedAt = 0;
     const old = this.socket;
     this.socket = undefined;
     if (old) {
+      old.onopen = null;
+      old.onmessage = null;
+      old.onerror = null;
       old.onclose = null;
       old.close();
     }
@@ -1481,11 +1540,14 @@ export class Controller {
       this.lifecycle === "STOPPED"
     )
       return;
-    clearTimeout(this.reconnectTimer);
-    const delay =
-      Math.min(300_000, 2000 * 2 ** Math.min(this.reconnectAttempt++, 8)) *
-      (0.75 + Math.random() * 0.5);
-    this.reconnectTimer = setTimeout(() => this.wake(), delay);
+    if (this.reconnectTimer) return;
+    const delay = reconnectDelay(this.reconnectAttempt++);
+    this.reconnectAt = Date.now() + delay;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.reconnectAt = 0;
+      this.wake();
+    }, delay);
     void chrome.alarms.create("relay-reconnect", { when: Date.now() + Math.max(30_000, delay) });
   }
   wake: () => void = () => {};
@@ -1493,6 +1555,9 @@ export class Controller {
   async connect() {
     const s = this.local;
     if (!s || s.phase !== "active" || s.paused || this.halted) return;
+    // Install a durable wake before any network await or CONNECTING socket. An
+    // interrupted first connection must not depend on a JS timer surviving MV3.
+    await chrome.alarms.create("relay-reconnect", { periodInMinutes: 1 });
     if (this.lifecycle !== "LIVE") await this.hydrate();
     if (this.lifecycle !== "LIVE" || this.events.closing) return;
     this.disconnect();
@@ -1517,42 +1582,61 @@ export class Controller {
     this.socket = socket;
     this.socketStartedAt = Date.now();
     s.diagnostics.reconnects++;
-    await this.persist();
     socket.onopen = () => {
+      if (this.socket !== socket) return;
       this.network = "Live";
-      this.reconnectAttempt = 0;
+      this.socketOpenedAt = Date.now();
       this.socketStartedAt = 0;
       this.lastSocketMessage = Date.now();
       void chrome.alarms.create("relay-reconnect", { periodInMinutes: 1 });
       this.heartbeat = setInterval(() => {
+        if (this.socket !== socket) return;
         if (Date.now() - this.lastSocketMessage > 75_000) {
           this.disconnect();
           this.network = "Offline";
           this.scheduleReconnect();
           return;
         }
-        if (socket.readyState === WebSocket.OPEN) socket.send("ping");
+        if (socket.readyState === WebSocket.OPEN) {
+          try {
+            socket.send("ping");
+          } catch {
+            this.disconnect();
+            this.network = "Offline";
+            this.scheduleReconnect();
+          }
+        }
       }, 25_000);
       this.wake();
     };
     socket.onmessage = (event) => {
+      if (this.socket !== socket) return;
       this.lastSocketMessage = Date.now();
+      if (Date.now() - this.socketOpenedAt >= SOCKET_STABLE_MS) this.reconnectAttempt = 0;
       if (event.data === "changed") this.remoteChanges.note();
       if (event.data !== "pong") this.onSocketMessage(String(event.data));
     };
     socket.onclose = () => {
       if (this.socket === socket) {
-        this.socket = undefined;
-        clearInterval(this.heartbeat);
+        this.disconnect();
         this.network = "Offline";
         this.scheduleReconnect();
       }
     };
-    socket.onerror = () => socket.close();
+    socket.onerror = () => {
+      if (this.socket !== socket) return;
+      this.disconnect();
+      this.network = "Offline";
+      this.scheduleReconnect();
+    };
+    // Handlers must exist before yielding to a storage write: open/close can fire
+    // before IndexedDB completes, especially on a busy large-session startup.
+    await this.persist();
   }
   async socketMessage(data: string) {
     if (data === "changed") {
-      if (this.lifecycle !== "LIVE") return;
+      if (this.lifecycle !== "LIVE" || !this.remoteChanges.dirty) return;
+      if (this.reconnectAt > Date.now() && this.socket?.readyState !== WebSocket.OPEN) return;
       await this.captureLocal();
       await this.flush();
       return;
@@ -1561,10 +1645,18 @@ export class Controller {
     if (message.type === "revoked") await this.advanceChain(message.chain);
   }
   async reconnect() {
+    if (this.local?.paused || this.halted) return;
+    if (this.lifecycle !== "LIVE") {
+      await this.connect();
+      return;
+    }
     if (this.socket?.readyState === WebSocket.OPEN) {
       await this.captureLocal();
       await this.flush();
-    } else await this.connect();
+    } else if (
+      socketNeedsReconnect(this.socket?.readyState, this.socketStartedAt, this.lastSocketMessage)
+    )
+      await this.connect();
   }
   private async wipeRevoked() {
     this.disconnect();
@@ -1578,6 +1670,7 @@ export class Controller {
     this.halted = true;
   }
   async watchdog() {
+    if (this.reconnectAt > Date.now()) return;
     if (
       !socketNeedsReconnect(this.socket?.readyState, this.socketStartedAt, this.lastSocketMessage)
     )
@@ -1686,6 +1779,13 @@ export class Controller {
             paused: s?.paused ?? false,
             socketReadyState: this.socket?.readyState ?? WebSocket.CLOSED,
             reconnectAttempt: this.reconnectAttempt,
+            reconnectBackoff: Math.max(0, this.reconnectAt - Date.now()),
+            pendingTasks: this.pendingTasks(),
+            network: this.network,
+            storageWrites: this.storageWrites,
+            serverRequests: this.serverRequests,
+            lastTransientError: this.lastTransientError,
+            lastFatalError: this.lastFatalError,
             lastSocketMessageAge:
               this.lastSocketMessage > 0 ? Date.now() - this.lastSocketMessage : undefined,
             events: this.events.summary(),

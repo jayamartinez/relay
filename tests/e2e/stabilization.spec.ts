@@ -90,7 +90,13 @@ test("live sync survives large changes, recovery, restart, and window shutdown",
         timeout: 30_000,
       })
       .toBe(70);
-    await a.page.evaluate((ids) => chrome.tabs.remove(ids), massIds);
+    await a.page.evaluate((ids) => chrome.tabs.remove(ids), massIds.slice(0, 50));
+    await expect
+      .poll(async () => (await web(b.page)).filter((value) => value.includes("/mass-")).length, {
+        timeout: 30_000,
+      })
+      .toBe(20);
+    await a.page.evaluate((ids) => chrome.tabs.remove(ids), massIds.slice(50));
     await expect
       .poll(async () => (await web(b.page)).filter((value) => value.includes("/mass-")).length, {
         timeout: 30_000,
@@ -232,6 +238,13 @@ test("live sync survives large changes, recovery, restart, and window shutdown",
       .toBe(true);
     expect((await windows(b.page)).length).toBe(2);
     expect((await windows(a.page)).length).toBe(2);
+    await b.page.evaluate(
+      (destination) => chrome.tabs.create({ url: destination, active: false }),
+      url("after-browser-restart"),
+    );
+    await expect
+      .poll(async () => (await web(a.page)).includes(url("after-browser-restart")))
+      .toBe(true);
   } finally {
     for (const context of contexts) await context.close();
     server.closeAllConnections();

@@ -130,6 +130,8 @@ export class BrowserEvents {
     this.committedUrls.clear();
   }
   restore(value: BrowserBatch) {
+    // Re-arm consumed evidence after a failed browser query, retaining newer input.
+    this.due = Math.max(this.due, Date.now() + NAVIGATION_DELAY);
     for (const [tab, commit] of value.commits ?? [])
       if (!this.commits.has(tab)) this.commits.set(tab, commit);
     for (const key of value.closedTabs) this.pending.closedTabs.add(key);

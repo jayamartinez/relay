@@ -3,9 +3,13 @@
 /** Serializes extension work without allowing one rejected task to poison later work. */
 export class SerialTaskQueue {
   private tail: Promise<void> = Promise.resolve();
+  pending = 0;
 
   run<T>(task: () => Promise<T>, failed: (error: unknown) => void): Promise<T> {
-    const next = this.tail.then(task);
+    this.pending++;
+    const next = this.tail.then(task).finally(() => {
+      this.pending--;
+    });
     this.tail = next.then(
       () => undefined,
       (error) => {

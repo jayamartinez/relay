@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { ApiError, ChallengeValidationError } from "./api";
 import { asBrowserRuntimeRace } from "./browser-runtime";
+import { StorageInterruptedError } from "./storage-runtime";
 
 export type FailureDisposition = "transient" | "action-required" | "fatal";
 export interface FailurePolicy {
@@ -10,11 +11,13 @@ export interface FailurePolicy {
 }
 
 export function failurePolicy(error: unknown): FailurePolicy {
+  if (error instanceof StorageInterruptedError)
+    return { category: "STORAGE_INTERRUPTED", disposition: "transient", browserRace: false };
   if (asBrowserRuntimeRace(error))
     return { category: "BROWSER_RUNTIME_RACE", disposition: "transient", browserRace: true };
   if (
     error instanceof ApiError &&
-    (error.status === 0 || error.status === 429 || error.status >= 500)
+    (error.status === 0 || error.status === 408 || error.status === 429 || error.status >= 500)
   )
     return { category: "NETWORK", disposition: "transient", browserRace: false };
   if (error instanceof ApiError && [404, 409, 410].includes(error.status))
@@ -26,7 +29,8 @@ export function failurePolicy(error: unknown): FailurePolicy {
   if (error instanceof ChallengeValidationError)
     return {
       category: `CHALLENGE_${error.code}`,
-      disposition: "fatal",
+      // Fresh authentication is safe; the expired challenge is still rejected.
+      disposition: error.code === "EXPIRED" ? "transient" : "fatal",
       browserRace: false,
     };
   const message = error instanceof Error ? error.message : "";

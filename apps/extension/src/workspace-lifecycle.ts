@@ -32,6 +32,33 @@ export function restoreMapping(
   // old URL can still identify a tab whose canonical destination changed while offline.
   seed.observed = structuredClone(target);
   const candidates = Object.values(target.windows).sort((a, b) => a.order - b.order);
+  const portableByWindow = new Map(actual.map((w) => [w.local, localTabs(w, origin)]));
+  const indexed = new Map(
+    candidates.map((w) => {
+      const tabs = tabsIn(target, w.id);
+      const current = tabs.map(tabSignature);
+      const prior = tabsIn(previous.observed, w.id).map(tabSignature);
+      const bySignature = new Map<string, string[]>();
+      // Reverse once so pop() consumes duplicate occurrences in canonical order.
+      for (const tab of [...tabs].reverse()) {
+        const old = previous.observed.tabs[tab.id];
+        for (const value of new Set([tabSignature(tab), ...(old ? [tabSignature(old)] : [])])) {
+          const matches = bySignature.get(value) ?? [];
+          matches.push(tab.id);
+          bySignature.set(value, matches);
+        }
+      }
+      return [
+        w.id,
+        {
+          tabs,
+          exact: new Set([canonical(current), canonical(prior)]),
+          overlap: new Set([...current, ...prior]),
+          bySignature,
+        },
+      ] as const;
+    }),
+  );
   const usedWindows = new Set<string>();
   const usedTabs = new Set<string>();
   const assign = (window: ObservedWindow, key: string) => {
@@ -43,28 +70,20 @@ export function restoreMapping(
     if (key && target.windows[key] && !usedWindows.has(key)) assign(window, key);
   }
   for (const window of actual.filter((w) => !seed.windows[w.local])) {
-    const local = localTabs(window, origin).map((t) => signature(t.kind, t.tab.pinned));
+    const local = portableByWindow.get(window.local)!.map((t) => signature(t.kind, t.tab.pinned));
     if (!local.length) continue;
     const matches = candidates.filter(
-      (w) =>
-        !usedWindows.has(w.id) &&
-        [target, previous.observed].some(
-          (state) => canonical(tabsIn(state, w.id).map(tabSignature)) === canonical(local),
-        ),
+      (w) => !usedWindows.has(w.id) && indexed.get(w.id)!.exact.has(canonical(local)),
     );
     if (matches.length === 1) assign(window, matches[0]!.id);
   }
   for (const window of actual.filter((w) => !seed.windows[w.local])) {
-    const local = localTabs(window, origin).map((t) => signature(t.kind, t.tab.pinned));
+    const local = portableByWindow.get(window.local)!.map((t) => signature(t.kind, t.tab.pinned));
     const scores = candidates
       .filter((w) => !usedWindows.has(w.id))
       .map((w) => ({
         id: w.id,
-        score: local.filter((value) =>
-          [target, previous.observed].some((state) =>
-            tabsIn(state, w.id).some((t) => tabSignature(t) === value),
-          ),
-        ).length,
+        score: local.filter((value) => indexed.get(w.id)!.overlap.has(value)).length,
       }))
       .sort((a, b) => b.score - a.score);
     if (scores[0]?.score && scores[0].score > (scores[1]?.score ?? 0)) assign(window, scores[0].id);
@@ -79,25 +98,22 @@ export function restoreMapping(
   for (const window of actual) {
     const key = seed.windows[window.local];
     if (!key) continue;
-    for (const { tab, kind } of localTabs(window, origin)) {
+    for (const { tab, kind } of portableByWindow.get(window.local)!) {
       let logical = previous.session === session ? previous.tabs[tab.local] : undefined;
       if (!logical || !target.tabs[logical] || usedTabs.has(logical)) {
         const value = signature(kind, tab.pinned);
-        logical = tabsIn(target, key).find(
-          (candidate) =>
-            !usedTabs.has(candidate.id) &&
-            (tabSignature(candidate) === value ||
-              (previous.observed.tabs[candidate.id] &&
-                tabSignature(previous.observed.tabs[candidate.id]!) === value)),
-        )?.id;
+        const matches = indexed.get(key)!.bySignature.get(value);
+        do {
+          logical = matches?.pop();
+        } while (logical && usedTabs.has(logical));
       }
       if (logical) {
         seed.tabs[tab.local] = logical;
         usedTabs.add(logical);
       }
     }
-    const portable = localTabs(window, origin);
-    const canonicalTabs = tabsIn(target, key);
+    const portable = portableByWindow.get(window.local)!;
+    const canonicalTabs = indexed.get(key)!.tabs;
     if (
       portable.length === 1 &&
       portable[0]!.kind.kind === "newtab" &&
@@ -124,11 +140,11 @@ export function restoreMapping(
   // Observe allocates new IDs for genuinely unmatched local tabs, never for mapped windows.
   const observed = observe(actual, seed, session, source, origin).mapping;
   const changes: Change[] = [];
+  const appended = new Map<string, number>();
   for (const tab of Object.values(observed.observed.tabs))
     if (!target.tabs[tab.id]) {
-      const index =
-        tabsIn(target, tab.window).length +
-        changes.filter((c) => c.type === "tab-create" && c.tab.window === tab.window).length;
+      const index = (indexed.get(tab.window)?.tabs.length ?? 0) + (appended.get(tab.window) ?? 0);
+      appended.set(tab.window, (appended.get(tab.window) ?? 0) + 1);
       changes.push({ type: "tab-create", tab: { ...tab, index } });
     }
   // Missing resources at startup are not deletion evidence. Canonical state fills them in.

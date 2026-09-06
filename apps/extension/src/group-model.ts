@@ -48,6 +48,13 @@ export function observeGroups(
   next.collapsed = { ...previous.collapsed };
   next.observed.groups = {};
   const used = new Set<string>();
+  const groupsByMembers = new Map<string, string[]>();
+  for (const group of Object.values(previous.observed.groups ?? {})) {
+    const signature = canonical([...group.tabs].sort());
+    const matches = groupsByMembers.get(signature) ?? [];
+    matches.push(group.id);
+    groupsByMembers.set(signature, matches);
+  }
   for (const window of windows) {
     const logicalWindow = next.windows[window.local];
     if (!logicalWindow) continue;
@@ -61,10 +68,8 @@ export function observeGroups(
         // Cross-window native moves may replace the browser ID. Match only an exact,
         // unambiguous set of already-mapped Relay tab IDs, never a title or URL alone.
         const signature = canonical([...tabs].sort());
-        const matches = Object.values(previous.observed.groups ?? {}).filter(
-          (g) => !used.has(g.id) && canonical([...g.tabs].sort()) === signature,
-        );
-        key = matches.length === 1 ? matches[0]!.id : crypto.randomUUID();
+        const matches = (groupsByMembers.get(signature) ?? []).filter((id) => !used.has(id));
+        key = matches.length === 1 ? matches[0]! : crypto.randomUUID();
       }
       used.add(key);
       next.groups[group.local] = key;

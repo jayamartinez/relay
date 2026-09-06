@@ -10,7 +10,7 @@ export class BrowserRuntimeRaceError extends Error {
 }
 
 const EXPECTED_CHROME_RACE =
-  /^(No tab with id:|No window with id:|Tabs cannot be edited right now|Cannot move a tab once|Cannot access a chrome:\/\/ URL|The tab was closed|The window was closed)/i;
+  /^(No tab with id:|No window with id:|No group with id:|Tabs cannot be edited right now|Cannot move a tab once|Cannot access a chrome:\/\/ URL|The tab was closed|The window was closed)/i;
 
 export function asBrowserRuntimeRace(error: unknown): BrowserRuntimeRaceError | undefined {
   if (error instanceof BrowserRuntimeRaceError) return error;

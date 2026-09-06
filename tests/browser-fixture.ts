@@ -2,12 +2,16 @@ import path from "node:path";
 import { chromium, expect, type Page } from "@playwright/test";
 import type { Status } from "../apps/extension/src/controller";
 
-export async function profile(directory = "") {
+export async function profile(directory = "", restoreSession = false) {
   const extension = path.resolve(process.env.RELAY_TEST_EXTENSION || "apps/extension/dist");
   const context = await chromium.launchPersistentContext(directory, {
     channel: "chromium",
     headless: true,
-    args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
+    args: [
+      `--disable-extensions-except=${extension}`,
+      `--load-extension=${extension}`,
+      ...(restoreSession ? ["--restore-last-session"] : []),
+    ],
   });
   const worker = context.serviceWorkers()[0] ?? (await context.waitForEvent("serviceworker"));
   const page = await context.newPage();

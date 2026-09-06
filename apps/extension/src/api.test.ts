@@ -1,8 +1,112 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { identity } from "@relay/crypto";
 import { afterEach, expect, it, vi } from "vitest";
 import { Api, ApiError, ChallengeValidationError, validateChallenge } from "./api";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+it.each(["sign", "response"])(
+  "refreshes an expired challenge after laptop sleep during %s without accepting invalid authentication",
+  async (stage) => {
+    vi.stubGlobal("__DEV__", false);
+    const device = await identity();
+    let now = 100_000,
+      sleep = true;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const sign = crypto.subtle.sign.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, "sign").mockImplementation(async (...args) => {
+      const result = await sign(...args);
+      if (sleep && stage === "sign") {
+        now += 31_000;
+        sleep = false;
+      }
+      return result;
+    });
+    const fetch = vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith("/challenge")) {
+        const { payload } = JSON.parse(String(init.body));
+        return Response.json({
+          version: 1,
+          account: "a".repeat(64),
+          device: payload.device,
+          purpose: payload.purpose,
+          digest: payload.digest,
+          nonce: crypto.randomUUID(),
+          issued: now,
+          expires: now + 30_000,
+        });
+      }
+      if (sleep && stage === "response") {
+        now += 31_000;
+        sleep = false;
+        return Response.json({ error: { code: "REQUEST_VALIDATION_FAILED" } }, { status: 400 });
+      }
+      return Response.json({ ok: true });
+    });
+    vi.stubGlobal("fetch", fetch);
+    const api = new Api("https://relay.example", "a".repeat(64));
+    await expect(
+      api.authenticated("sync", {}, device.device.id, device.signing),
+    ).rejects.toMatchObject({ code: "EXPIRED" });
+    await expect(api.authenticated("sync", {}, device.device.id, device.signing)).resolves.toEqual({
+      ok: true,
+    });
+    expect(fetch.mock.calls.filter(([url]) => url.endsWith("/challenge"))).toHaveLength(2);
+  },
+);
+
+it.each([408, 429, 502, 503])("recovers from a non-JSON HTTP %i outage", async (status) => {
+  vi.stubGlobal("__DEV__", false);
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce(new Response("<html>unavailable</html>", { status }))
+      .mockResolvedValueOnce(Response.json({ ok: true })),
+  );
+  const api = new Api("https://relay.example", "a".repeat(64));
+  await expect(api.post("sync", {})).rejects.toMatchObject({
+    status,
+    code: "NETWORK_RESPONSE_FAILED",
+  });
+  await expect(api.post("sync", {})).resolves.toEqual({ ok: true });
+});
+
+it.each(["AbortError", "TimeoutError", "TypeError"])(
+  "recovers when the response stream fails with %s after headers",
+  async (name) => {
+    vi.stubGlobal("__DEV__", false);
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.error(new DOMException("test interruption", name));
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response(stream))
+        .mockResolvedValueOnce(Response.json({ ok: true })),
+    );
+    const api = new Api("https://relay.example", "a".repeat(64));
+    await expect(api.post("sync", {})).rejects.toMatchObject({
+      status: 0,
+      code: "NETWORK_RESPONSE_INTERRUPTED",
+    });
+    await expect(api.post("sync", {})).resolves.toEqual({ ok: true });
+  },
+);
+
+it("still fails closed on malformed successful protocol responses", async () => {
+  vi.stubGlobal("__DEV__", false);
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("not JSON")));
+  await expect(
+    new Api("https://relay.example", "a".repeat(64)).post("sync", {}),
+  ).rejects.not.toBeInstanceOf(ApiError);
+});
 
 it("keeps request preparation failures separate from network failures", async () => {
   vi.stubGlobal("__DEV__", true);

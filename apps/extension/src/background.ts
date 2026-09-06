@@ -19,6 +19,7 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onDisconnect.addListener(() => statusPorts.delete(port));
 });
 const serial = new SerialTaskQueue();
+controller.pendingTasks = () => serial.pending;
 function run<T>(task: () => Promise<T>): Promise<T> {
   return serial.run(
     async () => {
@@ -39,18 +40,22 @@ controller.onSocketMessage = (data) => {
     .catch(() => {});
 };
 let debounce: ReturnType<typeof setTimeout> | undefined;
+let browserTaskQueued = false;
 function changed() {
   controller.events.changed();
   schedule();
 }
 function schedule() {
+  if (browserTaskQueued) return;
   clearTimeout(debounce);
   debounce = setTimeout(
     () => {
+      browserTaskQueued = true;
       void run(() => controller.browserChanged())
         .catch(() => {})
         .finally(() => {
-          if (controller.events.readyAt > 0) schedule();
+          browserTaskQueued = false;
+          if (controller.browserWorkPending) schedule();
         });
     },
     Math.max(0, controller.events.readyAt - Date.now()),
