@@ -41,9 +41,20 @@ export function observeGroups(
 ) {
   if (!windows.some((w) => w.groups !== undefined)) return;
   next.groups = {};
-  next.collapsed = {};
+  // A browser-restored group is authoritative for its current physical state, but a
+  // temporarily missing group must not erase the device-local preference needed if
+  // reconciliation has to recreate it. Logical deletion is pruned separately once
+  // the synchronized workspace no longer contains the group.
+  next.collapsed = { ...previous.collapsed };
   next.observed.groups = {};
   const used = new Set<string>();
+  const groupsByMembers = new Map<string, string[]>();
+  for (const group of Object.values(previous.observed.groups ?? {})) {
+    const signature = canonical([...group.tabs].sort());
+    const matches = groupsByMembers.get(signature) ?? [];
+    matches.push(group.id);
+    groupsByMembers.set(signature, matches);
+  }
   for (const window of windows) {
     const logicalWindow = next.windows[window.local];
     if (!logicalWindow) continue;
@@ -57,10 +68,8 @@ export function observeGroups(
         // Cross-window native moves may replace the browser ID. Match only an exact,
         // unambiguous set of already-mapped Relay tab IDs, never a title or URL alone.
         const signature = canonical([...tabs].sort());
-        const matches = Object.values(previous.observed.groups ?? {}).filter(
-          (g) => !used.has(g.id) && canonical([...g.tabs].sort()) === signature,
-        );
-        key = matches.length === 1 ? matches[0]!.id : crypto.randomUUID();
+        const matches = (groupsByMembers.get(signature) ?? []).filter((id) => !used.has(id));
+        key = matches.length === 1 ? matches[0]! : crypto.randomUUID();
       }
       used.add(key);
       next.groups[group.local] = key;
@@ -76,6 +85,18 @@ export function observeGroups(
       next.observed.version = 2;
     }
   }
+}
+export function pruneCollapsedGroups(mapping: Mapping, workspace: Workspace) {
+  if (!mapping.collapsed) return;
+  for (const id of Object.keys(mapping.collapsed))
+    if (!workspace.groups[id]) delete mapping.collapsed[id];
+}
+export function updateCollapsedGroup(mapping: Mapping, local: number, collapsed: boolean): boolean {
+  const logical = mapping.groups?.[local];
+  if (!logical || mapping.collapsed?.[logical] === collapsed) return false;
+  mapping.collapsed ??= {};
+  mapping.collapsed[logical] = collapsed;
+  return true;
 }
 export function groupMutationValue(change: Extract<Change, { type: "group-create" }>) {
   return canonical({ type: change.type, group: groupStructure(change.group) });

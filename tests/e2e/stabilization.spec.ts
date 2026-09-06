@@ -22,7 +22,7 @@ async function seed(page: Page, names: string[]) {
     return created;
   }, names.map(url));
 }
-test("single-window join, navigation loads, last-window exit and rapid multi-window shutdown", async () => {
+test("live sync survives large changes, recovery, restart, and window shutdown", async () => {
   const contexts: BrowserContext[] = [];
   const loads = new Map<string, number>();
   const server = createServer((request, response) => {
@@ -73,6 +73,72 @@ test("single-window join, navigation loads, last-window exit and rapid multi-win
     expect(loads.get(url("rapid-A")) ?? 0).toBeLessThanOrEqual(1);
     expect(loads.get(url("rapid-B")) ?? 0).toBeLessThanOrEqual(1);
     await expect.poll(() => loads.get(url("rapid-C"))).toBe(2);
+
+    // A realistic large mutation must leave both controllers capable of future live work.
+    const massIds = await a.page.evaluate(
+      async (destinations) =>
+        Promise.all(
+          destinations.map(
+            async (destination) =>
+              (await chrome.tabs.create({ url: destination, active: false })).id!,
+          ),
+        ),
+      Array.from({ length: 70 }, (_, index) => url(`mass-${index % 11}-${index}`)),
+    );
+    await expect
+      .poll(async () => (await web(b.page)).filter((value) => value.includes("/mass-")).length, {
+        timeout: 30_000,
+      })
+      .toBe(70);
+    await a.page.evaluate((ids) => chrome.tabs.remove(ids), massIds.slice(0, 50));
+    await expect
+      .poll(async () => (await web(b.page)).filter((value) => value.includes("/mass-")).length, {
+        timeout: 30_000,
+      })
+      .toBe(20);
+    await a.page.evaluate((ids) => chrome.tabs.remove(ids), massIds.slice(50));
+    await expect
+      .poll(async () => (await web(b.page)).filter((value) => value.includes("/mass-")).length, {
+        timeout: 30_000,
+      })
+      .toBe(0);
+    await a.page.evaluate(
+      (destination) => chrome.tabs.create({ url: destination, active: false }),
+      url("after-mass-close"),
+    );
+    await expect.poll(async () => (await web(b.page)).includes(url("after-mass-close"))).toBe(true);
+    await settle(a.page);
+    await settle(b.page);
+
+    // A closed transport reconnects without reloading the extension.
+    await b.context.setOffline(true);
+    await a.page.waitForTimeout(500);
+    await a.page.evaluate(
+      (destination) => chrome.tabs.create({ url: destination, active: false }),
+      url("during-network-loss"),
+    );
+    await b.context.setOffline(false);
+    await expect
+      .poll(async () => (await web(b.page)).includes(url("during-network-loss")), {
+        timeout: 30_000,
+      })
+      .toBe(true);
+    await settle(b.page);
+
+    // Terminating the MV3 worker must reconnect and continue receiving later changes.
+    const workerSession = await b.context.newCDPSession(b.page);
+    await workerSession.send("ServiceWorker.enable");
+    await workerSession.send("ServiceWorker.stopAllWorkers");
+    await a.page.evaluate(
+      (destination) => chrome.tabs.create({ url: destination, active: false }),
+      url("after-worker-restart"),
+    );
+    await expect
+      .poll(async () => (await web(b.page)).includes(url("after-worker-restart")), {
+        timeout: 30_000,
+      })
+      .toBe(true);
+    await settle(b.page);
     const beforeLocal = await web(b.page);
     await a.page.evaluate(() =>
       chrome.tabs.create({ url: "chrome://extensions", index: 1, active: false }),
@@ -157,12 +223,28 @@ test("single-window join, navigation loads, last-window exit and rapid multi-win
     ]).toEqual(multiDeletes);
 
     await b.context.close();
-    b = await profile(directory);
+    const reopening = profile(directory);
+    await a.page.evaluate(
+      (destination) => chrome.tabs.create({ url: destination, active: false }),
+      url("during-remote-reconcile"),
+    );
+    b = await reopening;
     contexts.push(b.context);
     await settle(b.page);
-    await expect.poll(async () => (await web(b.page)).sort()).toEqual(multiPreserved);
+    await expect
+      .poll(async () => (await web(b.page)).includes(url("during-remote-reconcile")), {
+        timeout: 30_000,
+      })
+      .toBe(true);
     expect((await windows(b.page)).length).toBe(2);
     expect((await windows(a.page)).length).toBe(2);
+    await b.page.evaluate(
+      (destination) => chrome.tabs.create({ url: destination, active: false }),
+      url("after-browser-restart"),
+    );
+    await expect
+      .poll(async () => (await web(a.page)).includes(url("after-browser-restart")))
+      .toBe(true);
   } finally {
     for (const context of contexts) await context.close();
     server.closeAllConnections();

@@ -26,6 +26,11 @@ export function committedNavigation(
     ["typed", "generated", "keyword", "keyword_generated", "auto_bookmark"].includes(transition);
   if (user && key !== receipt.expectedUrl) {
     receipt.expires = 0;
+    mapping.expected = mapping.expected.filter(
+      (event) =>
+        event.resource !== logical || !["tab-create", "tab-navigate"].includes(event.mutation),
+    );
+    if (mapping.reversals) delete mapping.reversals[logical!];
     return false;
   }
   if (qualifiers.some((q) => q === "server_redirect" || q === "client_redirect")) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { APPROVAL_EXPIRY_ALARM, Controller } from "./controller";
 import { groupsAvailable } from "./group-browser";
+import { SerialTaskQueue } from "./serial-task-queue";
 
 const controller = new Controller();
 const statusPorts = new Set<chrome.runtime.Port>();
@@ -17,14 +18,16 @@ chrome.runtime.onConnect.addListener((port) => {
   statusPorts.add(port);
   port.onDisconnect.addListener(() => statusPorts.delete(port));
 });
-let serial: Promise<unknown> = Promise.resolve();
+const serial = new SerialTaskQueue();
+controller.pendingTasks = () => serial.pending;
 function run<T>(task: () => Promise<T>): Promise<T> {
-  const next = serial.then(async () => {
-    await controller.load();
-    return task();
-  });
-  serial = next.catch((error) => controller.failure(error));
-  return next;
+  return serial.run(
+    async () => {
+      await controller.load();
+      return task();
+    },
+    (error) => controller.failure(error),
+  );
 }
 controller.wake = () => {
   void run(() => controller.reconnect())
@@ -37,18 +40,22 @@ controller.onSocketMessage = (data) => {
     .catch(() => {});
 };
 let debounce: ReturnType<typeof setTimeout> | undefined;
+let browserTaskQueued = false;
 function changed() {
   controller.events.changed();
   schedule();
 }
 function schedule() {
+  if (browserTaskQueued) return;
   clearTimeout(debounce);
   debounce = setTimeout(
     () => {
+      browserTaskQueued = true;
       void run(() => controller.browserChanged())
         .catch(() => {})
         .finally(() => {
-          if (controller.events.readyAt > 0) schedule();
+          browserTaskQueued = false;
+          if (controller.browserWorkPending) schedule();
         });
     },
     Math.max(0, controller.events.readyAt - Date.now()),
@@ -84,8 +91,11 @@ if (groupsAvailable()) {
   chrome.tabGroups.onCreated.addListener(changed);
   chrome.tabGroups.onRemoved.addListener(changed);
   chrome.tabGroups.onMoved.addListener(changed);
-  // A collapsed-only event updates local observation, but produces no wire mutation.
-  chrome.tabGroups.onUpdated.addListener(changed);
+  chrome.tabGroups.onUpdated.addListener((group) => {
+    // Collapsed state is a per-device preference, persisted by logical Relay group ID.
+    void run(() => controller.groupUpdated(group.id, group.collapsed)).catch(() => {});
+    changed(); // Title and color still flow through normal canonical observation.
+  });
 }
 chrome.tabs.onMoved.addListener(changed);
 chrome.tabs.onAttached.addListener(changed);

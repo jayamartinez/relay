@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { open, seal } from "@relay/crypto";
 import type { Cipher } from "@relay/protocol";
+import { storageError } from "./storage-runtime";
 
 const DB = "relay-v1";
 export async function remove(key: string): Promise<void> {
@@ -10,7 +11,7 @@ export async function remove(key: string): Promise<void> {
       const tx = db.transaction("vault", "readwrite");
       tx.objectStore("vault").delete(key);
       tx.oncomplete = () => resolve();
-      tx.onabort = () => reject(tx.error);
+      tx.onabort = () => reject(storageError(tx.error));
     });
   } finally {
     db.close();
@@ -21,7 +22,7 @@ function database(): Promise<IDBDatabase> {
     const req = indexedDB.open(DB, 1);
     req.onupgradeneeded = () => req.result.createObjectStore("vault");
     req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onerror = () => reject(storageError(req.error));
   });
 }
 export async function read<T>(key: string): Promise<T | undefined> {
@@ -30,7 +31,7 @@ export async function read<T>(key: string): Promise<T | undefined> {
     return await new Promise((resolve, reject) => {
       const request = db.transaction("vault").objectStore("vault").get(key);
       request.onsuccess = () => resolve(request.result as T | undefined);
-      request.onerror = () => reject(request.error);
+      request.onerror = () => reject(storageError(request.error));
     });
   } finally {
     db.close();
@@ -43,8 +44,8 @@ export async function write(key: string, value: unknown): Promise<void> {
       const tx = db.transaction("vault", "readwrite");
       tx.objectStore("vault").put(value, key);
       tx.oncomplete = () => resolve();
-      tx.onabort = () => reject(tx.error);
-      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(storageError(tx.error));
+      tx.onerror = () => reject(storageError(tx.error));
     });
   } finally {
     db.close();

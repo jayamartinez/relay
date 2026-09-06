@@ -93,6 +93,7 @@ export class Api {
     readonly origin: string,
     readonly account: string,
     readonly onTrace?: (event: string) => void,
+    readonly onRequest?: () => void,
   ) {}
   private trace(action: string, event: string) {
     if (!__DEV__) return;
@@ -141,6 +142,7 @@ export class Api {
     }));
     this.trace(action, "FETCH invoking fetch");
     let response: Response;
+    this.onRequest?.();
     try {
       response = await fetch(url, init);
     } catch (cause) {
@@ -173,6 +175,17 @@ export class Api {
       parsed = await this.parseResponse(response);
     } catch (cause) {
       this.trace(action, `RESPONSE_PARSE failed — ${errorDetails(cause)}`);
+      if (cause instanceof ApiError) throw cause;
+      // Proxies can return HTML for a temporary outage or rate limit. Preserve the
+      // HTTP failure category even when that response is not Relay JSON.
+      if (response.status === 408 || response.status === 429 || response.status >= 500)
+        throw new ApiError(
+          response.status,
+          "Relay server temporarily unavailable.",
+          "NETWORK_RESPONSE_FAILED",
+          "RESPONSE",
+          cause,
+        );
       throw new Error("Relay could not read the server response (RESPONSE_PARSE_FAILED).", {
         cause,
       });
@@ -205,7 +218,18 @@ export class Api {
     let size = 0;
     if (reader)
       while (true) {
-        const chunk = await reader.read();
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+          chunk = await reader.read();
+        } catch (cause) {
+          throw new ApiError(
+            0,
+            "Relay connection interrupted while reading the response. Your local changes are saved.",
+            "NETWORK_RESPONSE_INTERRUPTED",
+            "RESPONSE",
+            cause,
+          );
+        }
         if (chunk.done) break;
         size += chunk.value.byteLength;
         if (size > LIMITS.message * 4) {
@@ -240,6 +264,7 @@ export class Api {
       this.trace(action, `PROOF_DIGEST failed — ${errorDetails(cause)}`);
       throw new Error("Relay could not construct request proof (PROOF_DIGEST_FAILED).", { cause });
     }
+    const requestedAt = Date.now();
     const challenge = await this.post<Challenge>("challenge", { device, purpose: action, digest });
     this.trace(action, "CHALLENGE response received");
     try {
@@ -258,6 +283,21 @@ export class Api {
       this.trace(action, `PROOF_SIGNATURE failed — ${errorDetails(cause)}`);
       throw new Error("Relay could not sign request proof (PROOF_SIGNATURE_FAILED).", { cause });
     }
-    return this.post(action, payload, { challenge, signature });
+    // A sleeping laptop can resume after the server has discarded this one-use
+    // challenge. Refresh authentication rather than treating expiry as corruption.
+    if (Date.now() - requestedAt >= CHALLENGE_LIFETIME_MS)
+      throw new ChallengeValidationError("EXPIRED");
+    try {
+      return await this.post(action, payload, { challenge, signature });
+    } catch (error) {
+      if (
+        error instanceof ApiError &&
+        error.status === 400 &&
+        error.code === "REQUEST_VALIDATION_FAILED" &&
+        Date.now() - requestedAt >= CHALLENGE_LIFETIME_MS
+      )
+        throw new ChallengeValidationError("EXPIRED");
+      throw error;
+    }
   }
 }

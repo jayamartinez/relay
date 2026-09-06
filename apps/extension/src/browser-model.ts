@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import type { Change, LogicalTab, Workspace } from "@relay/protocol";
+import { type Change, type LogicalTab, tabsIn, type Workspace } from "@relay/protocol";
 import { canonical, isWeb, syncableTab } from "@relay/shared";
 import type { BrowserBatch } from "./browser-events";
 import { diffGroups, groupMutationValue, type ObservedGroup, observeGroups } from "./group-model";
@@ -159,6 +159,18 @@ export function diffWorkspace(previous: Workspace, current: Workspace): Change[]
     if (!current.windows[window.id]) changes.push({ type: "window-delete", id: window.id });
   return changes;
 }
+/** Canonical indices are ordering keys and may tie after concurrent/offline edits.
+ * Chrome needs contiguous physical positions. Normalize only the device projection,
+ * preserving canonical revisions, writer stamps, and the signed wire data.
+ */
+export function browserWorkspace(workspace: Workspace): Workspace {
+  const next = structuredClone(workspace);
+  for (const window of Object.keys(next.windows))
+    tabsIn(next, window).forEach((tab, index) => {
+      tab.index = index;
+    });
+  return next;
+}
 function fingerprint(tab: Pick<LogicalTab, "kind" | "url" | "pinned">): string {
   return canonical({ kind: tab.kind, url: tab.url, pinned: tab.pinned });
 }
@@ -177,6 +189,21 @@ export function observe(
   const result: Workspace = { ...mapping.observed, windows: {}, tabs: {} };
   const usedWindows = new Set<string>();
   const usedTabs = new Set<string>();
+  // Existing physical bindings own their IDs even when an identical newly opened
+  // tab appears earlier in the strip. Otherwise fallback matching steals that ID.
+  const reserved = new Set(
+    bootstrap ? [] : windows.flatMap((w) => w.tabs.map((t) => mapping.tabs[t.local])),
+  );
+  const candidates = new Map<string, Map<string, string[]>>();
+  for (const tab of Object.values(mapping.observed.tabs).sort((a, b) => b.index - a.index)) {
+    if (reserved.has(tab.id)) continue;
+    const window = candidates.get(tab.window) ?? new Map<string, string[]>();
+    const key = fingerprint(tab);
+    const matches = window.get(key) ?? [];
+    matches.push(tab.id);
+    window.set(key, matches);
+    candidates.set(tab.window, window);
+  }
   for (const window of windows) {
     if (mapping.ignoredWindows?.includes(window.local)) continue;
     const classified = window.tabs
@@ -220,15 +247,10 @@ export function observe(
       let tabId = !bootstrap ? mapping.tabs[String(tab.local)] : undefined;
       if (!tabId && mapping.observed.windows[windowId]) {
         // Window + kind/URL + pin + ordered duplicate occurrence; never URL alone.
-        const candidate = Object.values(mapping.observed.tabs)
-          .filter(
-            (t) =>
-              t.window === windowId &&
-              !usedTabs.has(t.id) &&
-              fingerprint(t) === fingerprint({ ...kind, pinned: tab.pinned }),
-          )
-          .sort((a, b) => a.index - b.index)[0];
-        if (candidate) tabId = candidate.id;
+        const matches = candidates.get(windowId)?.get(fingerprint({ ...kind, pinned: tab.pinned }));
+        do {
+          tabId = matches?.pop();
+        } while (tabId && usedTabs.has(tabId));
       }
       tabId ??= crypto.randomUUID();
       usedTabs.add(tabId);
@@ -267,20 +289,16 @@ export function authorizedChanges(
 ): Change[] {
   if (!actual.length) return []; // Final-window closure is a device lifetime event, never a reset.
   const tabs = new Map(actual.flatMap((w) => w.tabs).map((t) => [t.local, t]));
+  const closedWindows = new Set([...evidence.closingWindows].map((id) => previous.windows[id]));
+  const closedTabs = new Set([...evidence.closedTabs].map((id) => previous.tabs[id]));
+  for (const [local, logical] of Object.entries(previous.tabs)) {
+    const tab = tabs.get(Number(local));
+    if (tab?.url !== undefined && !syncableTab(tab.url, tab.incognito)) closedTabs.add(logical);
+  }
   return changes.filter((change) => {
-    if (change.type === "window-delete")
-      return Object.entries(previous.windows).some(
-        ([local, logical]) => logical === change.id && evidence.closingWindows.has(Number(local)),
-      );
+    if (change.type === "window-delete") return closedWindows.has(change.id);
     if (change.type !== "tab-delete") return true;
-    return Object.entries(previous.tabs).some(([local, logical]) => {
-      if (logical !== change.id) return false;
-      const tab = tabs.get(Number(local));
-      return (
-        evidence.closedTabs.has(Number(local)) ||
-        (tab?.url !== undefined && !syncableTab(tab.url, tab.incognito))
-      );
-    });
+    return closedTabs.has(change.id);
   });
 }
 export function physicalIndex(

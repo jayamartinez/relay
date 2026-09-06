@@ -2,7 +2,7 @@ import { emptyWorkspace, type LogicalTab } from "@relay/protocol";
 import { afterEach, expect, it, vi } from "vitest";
 import { capture, reconcile } from "./browser";
 import { BrowserEvents } from "./browser-events";
-import type { Mapping } from "./browser-model";
+import { browserWorkspace, type Mapping, observe } from "./browser-model";
 
 afterEach(() => vi.unstubAllGlobals());
 function fixture(existing: boolean) {
@@ -71,4 +71,62 @@ it("makes zero update calls for an already-current tab and emits no delayed call
     expect(result.changes).toEqual([]);
     mapping = result.mapping;
   }
+});
+
+it("projects tied canonical ordering keys into contiguous browser positions without rewriting canonical state", () => {
+  const f = fixture(true);
+  const state = {
+    ...f.target,
+    tabs: {
+      a: { ...f.target.tabs.tab, id: "a", index: 5 },
+      b: { ...f.target.tabs.tab, id: "b", index: 5 },
+      c: { ...f.target.tabs.tab, id: "c", index: 9, pinned: true },
+    },
+  };
+  const before = structuredClone(state);
+  const projected = browserWorkspace(state);
+  expect([projected.tabs.c!.index, projected.tabs.a!.index, projected.tabs.b!.index]).toEqual([
+    0, 1, 2,
+  ]);
+  expect(state).toEqual(before);
+});
+
+it("keeps both duplicate URLs when a new tab appears before an already mapped tab", () => {
+  const f = fixture(true);
+  const tabs = [8, 7].map((local, index) => ({
+    local,
+    window: 1,
+    index,
+    pinned: false,
+    incognito: false,
+    url: f.target.tabs.tab.url,
+  }));
+  const result = observe(
+    [{ local: 1, tabs }],
+    f.mapping,
+    "session",
+    "device",
+    "chrome-extension://relay",
+  );
+  expect(result.mapping.tabs[7]).toBe("tab");
+  expect(result.mapping.tabs[8]).not.toBe("tab");
+  expect(Object.keys(result.workspace.tabs)).toHaveLength(2);
+});
+
+it("does not replay a stale deletion after a tab navigates during reconciliation", async () => {
+  const f = fixture(true);
+  const get = vi.fn(
+    async () =>
+      ({
+        id: 7,
+        windowId: 1,
+        index: 0,
+        pinned: false,
+        incognito: false,
+        url: "https://example.com/user-navigation",
+      }) as chrome.tabs.Tab,
+  );
+  chrome.tabs.get = get as typeof chrome.tabs.get;
+  await reconcile({ ...f.target, tabs: {} }, f.mapping, "device", async () => {});
+  expect(chrome.tabs.remove).not.toHaveBeenCalled();
 });

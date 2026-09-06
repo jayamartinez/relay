@@ -35,7 +35,7 @@ test("approves in the popup, updates the badge, and continues after the popup cl
       .toBeTruthy();
     const code = (await status(authorized.page)).approvals[0]!.sas!;
     await expect(popup.getByText(code, { exact: true })).toBeVisible();
-    expect((await status(joining.page)).pair?.sas).toBe(code);
+    await expect.poll(async () => (await status(joining.page)).pair?.sas).toBe(code);
     expect(
       await popup.evaluate(() => ({
         clientWidth: document.body.clientWidth,

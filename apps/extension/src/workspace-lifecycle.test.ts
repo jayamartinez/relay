@@ -1,6 +1,6 @@
 import { applyOperation, type Change, emptyWorkspace, type Workspace } from "@relay/protocol";
 import { describe, expect, it } from "vitest";
-import { BrowserEvents } from "./browser-events";
+import { BrowserEvents, NAVIGATION_DELAY, WINDOW_CLOSE_DELAY } from "./browser-events";
 import {
   authorizedChanges,
   diffWorkspace,
@@ -174,7 +174,12 @@ describe("Explicit enrollment and device lifetime semantics", () => {
     events.removed(20, 2, true, 0);
     const actual = [window(1, ["a", "b"])];
     const observed = observe(actual, m, "old", "B", origin).workspace;
-    const changes = authorizedChanges(diffWorkspace(prior, observed), m, actual, events.take(600)!);
+    const changes = authorizedChanges(
+      diffWorkspace(prior, observed),
+      m,
+      actual,
+      events.take(WINDOW_CLOSE_DELAY)!,
+    );
     expect(changes).toEqual([{ type: "window-delete", id: "w2" }]);
     const result = apply(prior, changes);
     expect(result.tabs.c).toBeUndefined();
@@ -195,8 +200,8 @@ describe("Explicit enrollment and device lifetime semantics", () => {
     const events = new BrowserEvents();
     events.windowRemoved(1, 0);
     events.windowRemoved(2, 300);
-    expect(events.take(600)).toBeUndefined();
-    const evidence = events.take(900)!;
+    expect(events.take(WINDOW_CLOSE_DELAY)).toBeUndefined();
+    const evidence = events.take(WINDOW_CLOSE_DELAY + 300)!;
     expect([...evidence.closingWindows]).toEqual([1, 2]);
     expect(
       authorizedChanges([{ type: "window-delete", id: "w" }], mapping(), [], evidence),
@@ -231,5 +236,170 @@ describe("Explicit enrollment and device lifetime semantics", () => {
     expect(Object.values(result.workspace.tabs).map((t) => t.index)).toEqual([0, 1]);
     expect(Object.values(result.workspace.tabs).map((t) => t.url)).toEqual([url("a"), url("b")]);
     expect(physicalIndex(actual[0]!.tabs, 1, undefined, origin)).toBe(2);
+  });
+
+  it.each([1, 20, 70, 200])(
+    "adopts a %i-tab native restore with duplicates, pins, and device-local groups",
+    (count) => {
+      const target = state([]);
+      target.version = count >= 20 ? 2 : 1;
+      const actual = window(7, []);
+      actual.groups = [];
+      const previous = mapping(target);
+      previous.tabs = {};
+      previous.groups = {};
+      previous.collapsed = {};
+      for (let index = 0; index < count; index++) {
+        const id = `tab-${index}`;
+        const duplicate = `duplicate-${index % 9}`;
+        target.tabs[id] = {
+          id,
+          window: "w",
+          index,
+          pinned: index % 17 === 0,
+          kind: "web",
+          url: url(duplicate),
+          source: "A",
+          changed: 0,
+        };
+        previous.tabs[10 + index] = id;
+        actual.tabs.push({
+          local: 1000 + index,
+          window: 7,
+          index,
+          pinned: index % 17 === 0,
+          incognito: false,
+          url: url(duplicate),
+        });
+      }
+      previous.observed = structuredClone(target);
+      if (count >= 20) {
+        for (let groupIndex = 0; groupIndex < Math.min(6, Math.floor(count / 10)); groupIndex++) {
+          const id = `group-${groupIndex}`;
+          const members = Array.from({ length: 4 }, (_, offset) => groupIndex * 10 + offset + 1)
+            .filter((index) => index < count && !target.tabs[`tab-${index}`]!.pinned)
+            .map((index) => `tab-${index}`);
+          target.groups[id] = {
+            id,
+            window: "w",
+            title: `Group ${groupIndex}`,
+            color: groupIndex % 2 ? "blue" : "green",
+            tabs: members,
+            changed: 0,
+          };
+          previous.observed.groups[id] = structuredClone(target.groups[id]!);
+          previous.groups![50 + groupIndex] = id;
+          previous.collapsed![id] = groupIndex % 2 === 0;
+          actual.groups!.push({
+            local: 500 + groupIndex,
+            title: `Group ${groupIndex}`,
+            color: groupIndex % 2 ? "blue" : "green",
+            collapsed: groupIndex % 2 !== 0,
+            tabs: members.map((id) => 1000 + Number(id.slice(4))),
+          });
+        }
+      }
+
+      const restored = restoreMapping([actual], previous, target, "new", "B", origin);
+
+      expect(restored.changes).toEqual([]);
+      expect(Object.keys(restored.mapping.tabs)).toHaveLength(count);
+      expect(new Set(Object.values(restored.mapping.tabs)).size).toBe(count);
+      expect(Object.keys(restored.mapping.groups ?? {})).toHaveLength(
+        Object.keys(target.groups).length,
+      );
+      for (const [native, logical] of Object.entries(restored.mapping.groups ?? {}))
+        expect(restored.mapping.collapsed?.[logical]).toBe(
+          actual.groups!.find((group) => group.local === Number(native))?.collapsed,
+        );
+    },
+  );
+
+  it("keeps processing a 200-tab rapid close, navigation, and create burst", () => {
+    const prior = state([]);
+    const m = mapping(prior);
+    m.tabs = {};
+    const actual = window(1, []);
+    const events = new BrowserEvents();
+    for (let index = 0; index < 200; index++) {
+      const id = `stress-${index}`;
+      prior.tabs[id] = {
+        id,
+        window: "w",
+        index,
+        pinned: index % 19 === 0,
+        kind: "web",
+        url: url(`same-${index % 8}`),
+        source: "A",
+        changed: 0,
+      };
+      m.tabs[1000 + index] = id;
+      if (index < 70) events.removed(1000 + index, 1, false, 0);
+      else {
+        const navigated = index < 140;
+        actual.tabs.push({
+          local: 1000 + index,
+          window: 1,
+          index: index - 70,
+          pinned: index % 19 === 0,
+          incognito: false,
+          url: navigated ? url(`navigated-${index}`) : url(`same-${index % 8}`),
+        });
+        if (navigated) events.navigation(1000 + index, url(`navigated-${index}`), true, 0);
+      }
+    }
+    for (let index = 0; index < 20; index++)
+      actual.tabs.push({
+        local: 2000 + index,
+        window: 1,
+        index: actual.tabs.length,
+        pinned: false,
+        incognito: false,
+        url: url(`created-${index % 4}`),
+      });
+    m.observed = structuredClone(prior);
+
+    const observed = observe([actual], m, "old", "B", origin);
+    const changes = authorizedChanges(
+      diffWorkspace(prior, observed.workspace),
+      m,
+      [actual],
+      events.take(NAVIGATION_DELAY)!,
+    );
+
+    expect(changes.filter((change) => change.type === "tab-delete")).toHaveLength(70);
+    expect(changes.filter((change) => change.type === "tab-navigate")).toHaveLength(70);
+    expect(changes.filter((change) => change.type === "tab-create")).toHaveLength(20);
+  });
+
+  it.each([70, 200])("suppresses a %i-tab multi-window browser shutdown", (count) => {
+    const prior = state([]);
+    prior.windows.w2 = { id: "w2", order: 1, changed: 0 };
+    const m = mapping(prior);
+    m.windows = { 1: "w", 2: "w2" };
+    m.tabs = {};
+    const events = new BrowserEvents();
+    for (let index = 0; index < count; index++) {
+      const logical = `shutdown-${index}`;
+      const local = 1000 + index;
+      const nativeWindow = index < count / 2 ? 1 : 2;
+      const logicalWindow = nativeWindow === 1 ? "w" : "w2";
+      prior.tabs[logical] = {
+        id: logical,
+        window: logicalWindow,
+        index: index,
+        pinned: false,
+        kind: "web",
+        url: url(`shutdown-${index % 5}`),
+        source: "A",
+        changed: 0,
+      };
+      m.tabs[local] = logical;
+      events.removed(local, nativeWindow, true, index * 2);
+    }
+    m.observed = structuredClone(prior);
+    const evidence = events.take(count * 2 + WINDOW_CLOSE_DELAY)!;
+
+    expect(authorizedChanges(diffWorkspace(prior, emptyWorkspace()), m, [], evidence)).toEqual([]);
   });
 });

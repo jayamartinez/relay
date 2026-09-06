@@ -2,6 +2,7 @@
 import { tabsIn, type Workspace } from "@relay/protocol";
 import { assert, syncableTab } from "@relay/shared";
 import { type Mapping, observedTab, physicalIndex } from "./browser-model";
+import { BrowserRuntimeRaceError } from "./browser-runtime";
 
 declare const __DISABLE_TAB_GROUPS_FOR_DEVELOPMENT__: boolean;
 export interface BrowserCapabilities {
@@ -37,6 +38,7 @@ export async function reconcileGroups(
   target: Workspace,
   mapping: Mapping,
   persist: (mapping: Mapping) => Promise<void>,
+  allowed: () => boolean = () => true,
 ) {
   if (!groupsAvailable()) return;
   const localTabs = new Map(
@@ -52,11 +54,44 @@ export async function reconcileGroups(
   const liveGroups = await chrome.tabGroups.query({});
   const nativeGroups = new Map(liveGroups.map((g) => [g.id, g]));
   const oldMapping = { ...mapping.groups };
-  mapping.groups = {};
+  const nativeByLogical = new Map(
+    Object.entries(oldMapping).map(([native, logical]) => [logical, Number(native)]),
+  );
+  const membersByNative = new Map<number, number[]>();
+  for (const tab of [...live].sort((a, b) => a.index - b.index)) {
+    if (tab.id === undefined || tab.groupId < 0) continue;
+    const members = membersByNative.get(tab.groupId) ?? [];
+    members.push(tab.id);
+    membersByNative.set(tab.groupId, members);
+  }
+  const alreadyCurrent =
+    Object.values(target.groups).every((group) => {
+      const native = nativeByLogical.get(group.id);
+      const current = native === undefined ? undefined : nativeGroups.get(native);
+      const members = native === undefined ? [] : (membersByNative.get(native) ?? []);
+      return (
+        current &&
+        current.windowId === localWindows.get(group.window) &&
+        (current.title ?? "") === group.title &&
+        current.color === group.color &&
+        members.length === group.tabs.length &&
+        members.every((tab, index) => tab === localTabs.get(group.tabs[index]!))
+      );
+    }) &&
+    live.every((tab) => {
+      const logical = tab.id === undefined ? undefined : mapping.tabs[tab.id];
+      if (!logical || !target.tabs[logical]) return true;
+      const desired = desiredMembership.get(logical);
+      return desired ? oldMapping[tab.groupId] === desired : tab.groupId < 0;
+    });
+  if (alreadyCurrent) return;
+  mapping.groups = { ...oldMapping };
+  const usedGroups = new Set<number>();
   mapping.collapsed ??= {};
 
   // Only tracked tabs are ungrouped, never an unrelated local member or incognito tab.
   for (const tab of live) {
+    if (!allowed()) throw new BrowserRuntimeRaceError();
     if (tab.id === undefined || tab.incognito || tab.groupId < 0) continue;
     const logical = mapping.tabs[tab.id];
     if (!logical || !target.tabs[logical]) continue;
@@ -65,20 +100,16 @@ export async function reconcileGroups(
       await chrome.tabs.ungroup(tab.id);
   }
   for (const group of Object.values(target.groups)) {
+    if (!allowed()) throw new BrowserRuntimeRaceError();
     const windowId = localWindows.get(group.window);
     const tabIds = group.tabs
       .map((id) => localTabs.get(id))
       .filter((id): id is number => id !== undefined);
-    assert(
-      windowId !== undefined && tabIds.length === group.tabs.length,
-      "Group members are not available yet.",
-    );
+    if (windowId === undefined || tabIds.length !== group.tabs.length)
+      throw new BrowserRuntimeRaceError("Group members are not available yet.");
     live = await chrome.tabs.query({ windowId });
     const valid = tabIds.every((id) => live.some((t) => t.id === id && !t.incognito && !t.pinned));
-    assert(
-      valid,
-      "Group members changed during reconciliation. Retry when tab dragging has finished.",
-    );
+    if (!valid) throw new BrowserRuntimeRaceError("Group members changed during reconciliation.");
     const groupId = Object.entries(oldMapping).find(
       ([local, sync]) => sync === group.id && nativeGroups.has(Number(local)),
     )?.[0];
@@ -113,8 +144,10 @@ export async function reconcileGroups(
         ...(native === undefined ? { createProperties: { windowId } } : { groupId: native }),
       });
     assert(native !== undefined);
+    usedGroups.add(native);
+    const rebound = mapping.groups[native] !== group.id;
     mapping.groups[native] = group.id;
-    await persist(mapping); // Save returned IDs before metadata calls; replay adopts exact membership.
+    if (rebound) await persist(mapping); // Save returned IDs before metadata calls.
     // tabs.group does not promise to preserve the order of its tabIds argument when
     // adding tabs to an existing group. Restore member order after grouping itself.
     const members = (await chrome.tabs.query({ groupId: native })).sort(
@@ -123,6 +156,7 @@ export async function reconcileGroups(
     const start = members[0]?.index;
     assert(start !== undefined);
     for (const [index, tabId] of tabIds.entries()) {
+      if (!allowed()) throw new BrowserRuntimeRaceError();
       const member = await chrome.tabs.get(tabId);
       if (member.index !== start + index) await chrome.tabs.move(tabId, { index: start + index });
     }
@@ -136,10 +170,13 @@ export async function reconcileGroups(
           : {}),
       });
   }
+  for (const id of Object.keys(mapping.groups))
+    if (!usedGroups.has(Number(id))) delete mapping.groups[id];
   // Group/ungroup may shift native indices. Apply group blocks, not individual group members.
   for (const [logicalWindow, windowId] of localWindows) {
     const applied = new Set<string>();
     for (const tab of tabsIn(target, logicalWindow)) {
+      if (!allowed()) throw new BrowserRuntimeRaceError();
       const group = desiredMembership.get(tab.id);
       if (group) {
         if (applied.has(group)) continue;

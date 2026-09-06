@@ -1,7 +1,7 @@
 import { emptyWorkspace, type LogicalTab } from "@relay/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BrowserEvents } from "./browser-events";
-import type { Mapping } from "./browser-model";
+import { expectation, type Mapping, navigationCircuit } from "./browser-model";
 import {
   committedNavigation,
   expectNavigation,
@@ -28,6 +28,21 @@ const mapping = (): Mapping => ({
 });
 afterEach(() => vi.useRealTimers());
 describe("Persistent navigation ownership", () => {
+  it("does not pause explicit rapid address-bar navigation after a remote apply", () => {
+    const m = mapping();
+    expectNavigation(m, tab, 7, undefined, "remote-op");
+    m.expected.push(expectation({ type: "tab-create", tab }, "remote-op"));
+    for (let i = 0; i < 5; i++) {
+      const url = `https://example.com/typed-${i}`;
+      committedNavigation(m, 7, url, "typed", ["from_address_bar"]);
+      expect(
+        navigationCircuit(
+          [{ type: "tab-navigate", id: tab.id, kind: "web", url, source: "local" }],
+          m,
+        ),
+      ).toBe(false);
+    }
+  });
   it("skips an already normalized target URL before making a browser update", () => {
     expect(skipRemoteNavigation(mapping(), tab, 7, tab.url)).toBe(true);
     expect(
