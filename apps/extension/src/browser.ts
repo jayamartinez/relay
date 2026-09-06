@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { type Change, replicatedWorkspace, tabsIn, type Workspace } from "@relay/protocol";
+import {
+  type Change,
+  type LogicalTab,
+  replicatedWorkspace,
+  tabsIn,
+  type Workspace,
+} from "@relay/protocol";
 import { classifyTab, isWeb, syncableTab } from "@relay/shared";
 import type { BrowserBatch } from "./browser-events";
 import {
@@ -174,12 +180,25 @@ export async function reconcile(
   mapping: Mapping,
   source: string,
   persist: (mapping: Mapping) => Promise<void>,
-  allowed: () => boolean = () => true,
+  allowed: (tab?: LogicalTab, mutation?: "create" | "navigate") => boolean = () => true,
+  traceDetail: (tab?: LogicalTab) => string = () => `rev:${target.revision}`,
 ): Promise<Mapping> {
   target = browserWorkspace(replicatedWorkspace(target));
   requireGroupSupport(target);
   const next = structuredClone(mapping);
   const operationId = crypto.randomUUID();
+  const requireCurrent = (tab: LogicalTab, mutation: "create" | "navigate") => {
+    if (allowed(tab, mutation)) return;
+    trace(
+      "RECONCILE",
+      mutation === "create" ? "TAB_CREATE" : "TAB_NAVIGATE",
+      "SUPPRESS",
+      tab.id,
+      operationId,
+      `stale;${traceDetail(tab)}`,
+    );
+    throw new BrowserRuntimeRaceError();
+  };
   next.expected.push(
     ...diffWorkspace(mapping.observed, target).map((c) => expectation(c, operationId)),
   );
@@ -230,8 +249,16 @@ export async function reconcile(
         next.tabs[String(tab.id)] = first.id;
         localTabs.set(first.id, tab.id);
         if (!reusableFirst) {
+          requireCurrent(first, "create");
           expectNavigation(next, first, tab.id, undefined, operationId);
-          trace("RECONCILE", "TAB_CREATE", "APPLY", first.id, operationId);
+          trace(
+            "RECONCILE",
+            "TAB_CREATE",
+            "APPLY",
+            first.id,
+            operationId,
+            `window-create;${traceDetail(first)}`,
+          );
         }
       }
       await persist(next);
@@ -241,7 +268,9 @@ export async function reconcile(
       let localTab = localTabs.get(tab.id);
       let live = localTab === undefined ? undefined : await chrome.tabs.get(localTab);
       if (!live) {
+        requireCurrent(tab, "create");
         const current = await windowTabs(local);
+        requireCurrent(tab, "create");
         const created: chrome.tabs.Tab = await chrome.tabs.create({
           windowId: local,
           url: targetUrl(tab, ownOrigin()),
@@ -255,14 +284,33 @@ export async function reconcile(
         next.tabs[String(localTab)] = tab.id;
         localTabs.set(tab.id, created.id);
         expectNavigation(next, tab, created.id, undefined, operationId);
-        trace("RECONCILE", "TAB_CREATE", "APPLY", tab.id, operationId);
+        trace(
+          "RECONCILE",
+          "TAB_CREATE",
+          "APPLY",
+          tab.id,
+          operationId,
+          `missing-mapping;${traceDetail(tab)}`,
+        );
         await persist(next);
       }
       if (localTab === undefined || !live || live.incognito) continue;
       if (!skipRemoteNavigation(next, tab, localTab, live.pendingUrl ?? live.url)) {
+        // The initial browser snapshot may be hundreds of awaits old. Re-read the
+        // tab and let the controller reject a plan superseded by local intent.
+        live = await chrome.tabs.get(localTab);
+        requireCurrent(tab, "navigate");
+        if (skipRemoteNavigation(next, tab, localTab, live.pendingUrl ?? live.url)) continue;
         expectNavigation(next, tab, localTab, live.pendingUrl ?? live.url, operationId);
         await persist(next);
-        trace("REMOTE", "TAB_NAVIGATE", "APPLY", tab.id, operationId);
+        trace(
+          "REMOTE",
+          "TAB_NAVIGATE",
+          "APPLY",
+          tab.id,
+          operationId,
+          `reconcile-target;${traceDetail(tab)}`,
+        );
         await chrome.tabs.update(localTab, { url: targetUrl(tab, ownOrigin()) ?? "about:blank" });
       }
       if (live.pinned !== tab.pinned) await chrome.tabs.update(localTab, { pinned: tab.pinned });

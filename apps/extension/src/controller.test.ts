@@ -277,6 +277,7 @@ it.each(["worker restart", "extension reload", "browser restart"])(
       expect.anything(),
       expect.anything(),
       expect.anything(),
+      expect.anything(),
     );
     Socket.all.at(-1)!.open();
     await c.reconnect();

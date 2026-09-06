@@ -40,6 +40,33 @@ export interface Mapping {
   collapsed?: Record<string, boolean>;
   ignoredWindows?: number[];
   navigation?: Record<string, NavigationReceipt>;
+  /**
+   * Device-local user intent which has been observed but may not be committed yet.
+   * This is deliberately outside the encrypted workspace: it protects the local
+   * browser from an older canonical projection while the normal journal resolves it.
+   */
+  freshness?: FreshnessState;
+}
+export interface FreshnessState {
+  generation: number;
+  intents: Record<string, LocalIntent>;
+}
+export interface LocalIntent {
+  generation: number;
+  kind: "delete" | "navigate";
+  canonicalRevision: number;
+  url?: string;
+  journaled?: boolean;
+}
+export function recordLocalIntent(
+  mapping: Mapping,
+  id: string,
+  intent: Omit<LocalIntent, "generation">,
+): LocalIntent {
+  const freshness = (mapping.freshness ??= { generation: 0, intents: {} });
+  const value = { ...intent, generation: ++freshness.generation };
+  freshness.intents[id] = value;
+  return value;
 }
 export interface NavigationReceipt {
   local: number;
