@@ -857,7 +857,8 @@ pre {
 
 .popup {
   width: 340px;
-  min-height: 0;
+  min-width: 340px;
+  min-height: 300px;
   overflow: hidden;
   border-radius: var(--radius-surface);
   background:
@@ -867,8 +868,18 @@ pre {
 
 .popup main {
   width: 340px;
+  min-width: 340px;
+  min-height: 300px;
   border-radius: inherit;
   padding: 20px;
+}
+
+.popup .popup-loading {
+  min-height: 156px;
+}
+
+.settings .popup-initial-shell {
+  display: none;
 }
 
 .popup p {

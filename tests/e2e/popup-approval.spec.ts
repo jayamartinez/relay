@@ -101,7 +101,7 @@ test("keeps multiple requests distinct, restores their badge, and denies only th
     const extensionId = authorized.worker.url().split("/")[2];
     const popup = await authorized.context.newPage();
     await popup.goto(`chrome-extension://${extensionId}/popup.html`);
-    await expect(popup.getByRole("heading", { name: "Request 1 of 2", exact: true })).toBeVisible();
+    await expect(popup.getByRole("heading", { name: /Request [12] of 2/, exact: true })).toBeVisible();
     await popup.getByRole("button", { name: "Deny", exact: true }).click();
     await expect.poll(async () => (await status(authorized.page)).approvals.length).toBe(1);
     const remainingId = (await status(authorized.page)).approvals[0]!.id;

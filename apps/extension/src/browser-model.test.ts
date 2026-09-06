@@ -34,7 +34,7 @@ function mapping(): Mapping {
   };
 }
 describe("Browser identity and loop prevention", () => {
-  it("trips a bounded circuit on repeated remote-navigation reversals", () => {
+  it("trips a bounded circuit only for a repeated identical remote-navigation oscillation", () => {
     const m = mapping();
     const now = Date.now();
     const change = {
@@ -44,13 +44,66 @@ describe("Browser identity and loop prevention", () => {
       url: "https://redirect.example/",
       source: "a",
     };
-    m.expected = [
-      expectation({ ...change, url: "https://requested.example/", source: "b" }, "remote"),
-    ];
+    m.navigation = {
+      t: {
+        local: 10,
+        resource: "t",
+        operationId: "remote",
+        expectedUrl: "https://requested.example/",
+        expires: now + 15_000,
+        source: "REMOTE",
+      },
+    };
     expect(navigationCircuit([change], m, now)).toBe(false);
     expect(navigationCircuit([change], m, now + 1)).toBe(false);
-    expect(navigationCircuit([change], m, now + 2)).toBe(true);
+    expect(navigationCircuit([change], m, now + 2)).toBe(false);
+    expect(navigationCircuit([change], m, now + 3)).toBe(true);
     expect(navigationCircuit([change], m, now + 61_000)).toBe(false);
+  });
+  it("does not count local work, redirects, or changing user destinations as reversals", () => {
+    const m = mapping();
+    const now = Date.now();
+    m.navigation = {
+      t: {
+        local: 10,
+        resource: "t",
+        operationId: "remote",
+        expectedUrl: "https://requested.example/",
+        redirects: ["https://redirect.example/"],
+        expires: now + 15_000,
+        source: "REMOTE",
+      },
+    };
+    for (const url of [
+      "https://redirect.example/",
+      "https://user-a.example/",
+      "https://user-b.example/",
+      "https://user-c.example/",
+      "https://user-d.example/",
+    ])
+      expect(
+        navigationCircuit(
+          [{ type: "tab-navigate", id: "t", kind: "web", url, source: "a" }],
+          m,
+          now,
+        ),
+      ).toBe(false);
+    m.navigation.t!.source = "USER";
+    expect(
+      navigationCircuit(
+        [
+          {
+            type: "tab-navigate",
+            id: "t",
+            kind: "web",
+            url: "https://repeat.example/",
+            source: "a",
+          },
+        ],
+        m,
+        now,
+      ),
+    ).toBe(false);
   });
   it("remaps duplicate URLs by occurrence after restart", () => {
     const m = mapping();
