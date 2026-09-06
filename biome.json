@@ -11,7 +11,7 @@
       "!test-results"
     ]
   },
-  "formatter": { "indentStyle": "space", "lineWidth": 100, "lineEnding": "crlf" },
+  "formatter": { "indentStyle": "space", "lineWidth": 100 },
   "linter": { "enabled": true, "rules": { "preset": "none" } },
   "javascript": { "formatter": { "quoteStyle": "double" } }
 }
