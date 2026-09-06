@@ -7,7 +7,7 @@ const output = new URL("../apps/extension/dist/", import.meta.url);
 const files = await readdir(output);
 const manifest = JSON.parse(await readFile(new URL("manifest.json", output), "utf8"));
 assert.equal(manifest.manifest_version, 3);
-assert.equal(manifest.version, "1.0.0");
+assert.equal(manifest.version, "0.1.0");
 assert.equal(manifest.incognito, "not_allowed");
 assert.deepEqual(manifest.permissions, ["tabs", "storage", "alarms", "webNavigation", "tabGroups"]);
 assert(!manifest.content_scripts && !manifest.externally_connectable);
@@ -40,6 +40,11 @@ for (const file of files) {
     console.log(`${file}: ${bytes.length} bytes, ${gzipSync(bytes).length} bytes gzip`);
 }
 assert(bundledSource.includes(new URL(expectedOrigin).origin));
+for (const page of ["popup.html", "settings.html"])
+  assert.match(
+    await readFile(new URL(page, output), "utf8"),
+    /Relay 0\.1\.0 \((?:[0-9a-f]{7,64}|unknown)(?:-dirty)?\)/,
+  );
 if (!process.env.RELAY_OFFICIAL_ORIGIN)
   assert(!bundledSource.includes("https://relay-staging.relay-sync.workers.dev"));
 console.log(

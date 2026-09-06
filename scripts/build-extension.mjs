@@ -3,6 +3,7 @@
 import { copyFile, mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { deflateSync } from "node:zlib";
 import { build, context } from "esbuild";
+import { buildIdentifier } from "./build-metadata.mjs";
 
 const dev = process.argv.includes("--dev");
 const watch = process.argv.includes("--watch");
@@ -15,6 +16,12 @@ if (!["development", "staging", "production"].includes(channel))
 if (dev && requestedChannel && requestedChannel !== "development")
   throw new Error("Development builds cannot target a hosted Relay channel");
 const groups = true;
+const extensionPackage = JSON.parse(
+  await readFile(new URL("../apps/extension/package.json", import.meta.url), "utf8"),
+);
+const productVersion = extensionPackage.version;
+const buildId = buildIdentifier();
+const relayBuild = `Relay ${productVersion} (${buildId})`;
 const disableGroupsForDevelopment = dev && process.env.RELAY_DISABLE_TAB_GROUPS === "1";
 // Chrome match patterns cannot express private-IP CIDR ranges. This declaration is
 // only a development permission *ceiling*; settings validates private origins and
@@ -52,7 +59,7 @@ if (repository) {
 const manifest = {
   manifest_version: 3,
   name: "Relay",
-  version: "1.0.0",
+  version: productVersion,
   description:
     "End-to-end encrypted workspace synchronization. Built for Helium; independent and compatible with supported Chromium browsers.",
   minimum_chrome_version: "120",
@@ -109,7 +116,10 @@ for (const page of ["popup", "settings"]) {
     new URL("../apps/extension/public/page.html", import.meta.url),
     "utf8",
   );
-  await writeFile(new URL(`${page}.html`, out), template.replaceAll("__PAGE__", page));
+  await writeFile(
+    new URL(`${page}.html`, out),
+    template.replaceAll("__PAGE__", page).replaceAll("__RELAY_BUILD__", relayBuild),
+  );
 }
 // Rasterize the original two-link Relay mark without an image/runtime dependency.
 function crc32(data) {
@@ -179,6 +189,8 @@ const options = {
     __BUILD_CHANNEL__: JSON.stringify(channel),
     __OFFICIAL_ORIGIN__: JSON.stringify(official),
     __REPOSITORY_URL__: JSON.stringify(repository),
+    __PRODUCT_VERSION__: JSON.stringify(productVersion),
+    __BUILD_ID__: JSON.stringify(buildId),
   },
   tsconfig: "tsconfig.json",
   logLevel: "info",

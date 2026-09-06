@@ -1,6 +1,6 @@
 # Security
 
-Relay 1.0.0 is under development. No version has completed an independent security audit; there is not yet a production-supported release line.
+Relay 0.1.0 is under development. No version has completed an independent security audit; there is not yet a production-supported release line.
 
 Do not use disposable development builds as your sole copy of an important workspace. Keep recovery material private. Use trusted browsers, trusted extension builds, disk encryption and operating-system account protections.
 

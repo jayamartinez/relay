@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { adjacentApprovalId, approvalPosition, currentApproval, SingleFlight } from "./approval-ui";
+import { formatRelayBuild } from "./build-info";
 import type { Status } from "./controller";
 import { ago, brand, button, call, countLabel, el, groupedCode, masked, statusBadge } from "./ui";
 
+declare const __PRODUCT_VERSION__: string;
+declare const __BUILD_ID__: string;
 const app = document.getElementById("app");
 const requests = new SingleFlight();
 let state: Status;
@@ -12,7 +15,11 @@ let localAction: "approve" | "deny" | undefined;
 let resultTimer: ReturnType<typeof setTimeout> | undefined;
 
 function footer() {
-  return el("div", "footer", "End-to-end encrypted · Relay 1.0.0");
+  return el(
+    "div",
+    "footer",
+    `End-to-end encrypted · ${formatRelayBuild(__PRODUCT_VERSION__, __BUILD_ID__)}`,
+  );
 }
 
 function errorMessage(text: string) {

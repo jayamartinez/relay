@@ -6,7 +6,7 @@ Relay synchronizes browser tabs and windows between computers without a Google a
 
 Built for Helium. Works with compatible Chromium browsers.
 
-**Version 1.0.0 · Alpha.** This is functional pre-release software, not an audited or Chrome Web Store-approved release. Use disposable profiles for initial testing. Production builds use the official Relay Worker at `https://relay.relay-sync.workers.dev`.
+**Version 0.1.0 · Alpha.** This is functional pre-release software, not an audited or Chrome Web Store-approved release. Use disposable profiles for initial testing. Production builds use the official Relay Worker at `https://relay.relay-sync.workers.dev`.
 
 ## What works
 
