@@ -1,0 +1,11 @@
+{
+  "name": "@relay/extension",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@relay/protocol": "workspace:*",
+    "@relay/crypto": "workspace:*",
+    "@relay/shared": "workspace:*"
+  }
+}
