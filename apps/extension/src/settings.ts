@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { serverOrigin } from "@relay/shared";
+import { formatRelayBuild } from "./build-info";
 import type { Status } from "./controller";
 import {
   ago,
@@ -18,6 +19,8 @@ import {
 
 declare const __DEV__: boolean;
 declare const __REPOSITORY_URL__: string;
+declare const __PRODUCT_VERSION__: string;
+declare const __BUILD_ID__: string;
 const app = document.getElementById("app");
 let state: Status;
 let screen = "welcome";
@@ -604,7 +607,7 @@ function settings() {
       el(
         "p",
         "",
-        "Use the recovery information you saved during setup. Relay cannot retrieve it. Recovery key replacement is not available in this early v1 build.",
+        "Use the recovery information you saved during setup. Relay cannot retrieve it. Recovery key replacement is not available in this early Relay build.",
       ),
     );
   }
@@ -625,7 +628,7 @@ function settings() {
   if (section === "About") {
     content.append(
       brand(),
-      el("p", "about-version", "Version 1.0.0 · Alpha"),
+      el("p", "about-version", formatRelayBuild(__PRODUCT_VERSION__, __BUILD_ID__)),
       el(
         "p",
         "about-lede",

@@ -19,7 +19,7 @@ Relay assumes a trusted browser, installed extension build, operating system and
 
 No protection is promised against a compromised OS, malicious browser, malicious installed extension build, or compromised build/release pipeline. Device malware can see the decrypted browsing state or use non-extractable keys. Historic secrets may persist in backups, browser data and memory. There is no forward secrecy ratchet, hardware-backed attestation or guaranteed memory zeroization.
 
-Current members are equally privileged administrators. A hostile authorized device can modify snapshots, share keys, rename/revoke peers or approve another device. Relay v1 is single-account device synchronization, not mutually distrustful collaboration.
+Current members are equally privileged administrators. A hostile authorized device can modify snapshots, share keys, rename/revoke peers or approve another device. Relay v0.1.0 is single-account device synchronization, not mutually distrustful collaboration.
 
 A malicious server can suppress revocations to disconnected peers and keep those peers on an old fork. Devices that have accepted a new epoch will not send new-epoch keys to revoked members, but clients unaware of a withheld revocation may continue operating on their old view. No protocol without independent consistency witnesses can guarantee instantaneous global revocation against such server equivocation. Pinned control hashes catch rollback/forking against a client's known head; a fresh recovery installation cannot independently know which historically valid head is latest.
 
