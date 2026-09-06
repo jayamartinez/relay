@@ -2,6 +2,7 @@
 import { type Change, type LogicalTab, tabsIn, type Workspace } from "@relay/protocol";
 import { canonical, isWeb, syncableTab } from "@relay/shared";
 import type { BrowserBatch } from "./browser-events";
+import { trace } from "./diagnostics";
 import { diffGroups, groupMutationValue, type ObservedGroup, observeGroups } from "./group-model";
 export interface ObservedTab {
   local: number;
@@ -32,7 +33,9 @@ export interface Mapping {
   tabs: Record<string, string>;
   observed: Workspace;
   expected: Expectation[];
-  reversals?: Record<string, number[]>;
+  // Older persisted mappings stored bare timestamps. Discard those unattributed counts
+  // on first use rather than allowing an extension upgrade to pause a healthy device.
+  reversals?: Record<string, NavigationReversal | number[]>;
   groups?: Record<string, string>;
   collapsed?: Record<string, boolean>;
   ignoredWindows?: number[];
@@ -50,31 +53,65 @@ export interface NavigationReceipt {
   redirects?: string[];
   source?: "USER" | "REMOTE";
 }
+export interface NavigationReversal {
+  expectedUrl: string;
+  observedUrl: string;
+  operationId: string;
+  times: number[];
+}
+const NAVIGATION_REVERSAL_WINDOW = 60_000;
+const NAVIGATION_REVERSAL_LIMIT = 4;
 export function navigationKey(tab: Pick<LogicalTab, "kind" | "url">): string {
   return tab.kind === "newtab" ? "newtab" : (tab.url ?? "");
 }
 export function navigationCircuit(changes: Change[], mapping: Mapping, now = Date.now()): boolean {
   const reversals = mapping.reversals ?? {};
   for (const key of Object.keys(reversals)) {
-    reversals[key] = reversals[key]!.filter((time) => time > now - 60_000);
-    if (!reversals[key]?.length) delete reversals[key];
+    const reversal = reversals[key]!;
+    if (Array.isArray(reversal)) {
+      delete reversals[key];
+      continue;
+    }
+    reversal.times = reversal.times.filter((time) => time > now - NAVIGATION_REVERSAL_WINDOW);
+    if (!reversal.times.length) delete reversals[key];
   }
   let tripped = false;
   for (const change of changes) {
     if (change.type !== "tab-navigate") continue;
+    const receipt = mapping.navigation?.[change.id];
+    const observedUrl = navigationKey(change);
+    // Only a still-live remote browser mutation can be part of a Relay/browser
+    // oscillation. Generic expected-operation entries also cover local work, creates,
+    // and stale reconciliation intent, and therefore cannot safely attribute a reversal.
     if (
-      !mapping.expected.some(
-        (e) =>
-          e.resource === change.id &&
-          e.expires > now &&
-          ["tab-create", "tab-navigate"].includes(e.mutation),
-      )
+      !receipt ||
+      receipt.source !== "REMOTE" ||
+      receipt.expires <= now ||
+      observedUrl === receipt.expectedUrl ||
+      observedUrl === receipt.previousUrl ||
+      receipt.redirects?.includes(observedUrl)
     )
       continue;
-    const times = reversals[change.id] ?? [];
-    times.push(now);
-    reversals[change.id] = times.slice(-3);
-    if (times.length >= 3) tripped = true;
+    const prior = reversals[change.id];
+    const sameOscillation =
+      prior &&
+      !Array.isArray(prior) &&
+      prior.expectedUrl === receipt.expectedUrl &&
+      prior.observedUrl === observedUrl;
+    const times = [...(sameOscillation ? prior.times : []), now].slice(-NAVIGATION_REVERSAL_LIMIT);
+    reversals[change.id] = {
+      expectedUrl: receipt.expectedUrl,
+      observedUrl,
+      operationId: receipt.operationId,
+      times,
+    };
+    // Diagnostics deliberately retain only the logical-tab and operation suffixes
+    // already sanitized by trace(); URLs never enter the diagnostic stream.
+    trace("REMOTE", "NAVIGATION_REVERSAL", "DETECTED", change.id, receipt.operationId);
+    // One redirect, a stale event, and an ordinary user edit must not pause Relay.
+    // Four repeated applications of the same remote target that keep landing on the
+    // same contradictory URL are strong evidence of a real browser/site loop.
+    if (times.length >= NAVIGATION_REVERSAL_LIMIT) tripped = true;
   }
   mapping.reversals = reversals;
   return tripped;

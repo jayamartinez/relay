@@ -98,6 +98,19 @@ describe("Persistent navigation ownership", () => {
     committedNavigation(m, 7, "https://example.com/old", "link", ["forward_back"]);
     expect(remoteNavigationEvent(m, 7, "https://example.com/old", true)).toBe(false);
   });
+  it("keeps two healthy devices out of the reversal circuit after an owned remote apply", () => {
+    const m = mapping();
+    expectNavigation(m, tab, 7, "https://example.com/old", "remote-op");
+    for (const value of [tab.url!, tab.url!, tab.url!]) {
+      expect(remoteNavigationEvent(m, 7, value, true)).toBe(true);
+      expect(
+        navigationCircuit(
+          [{ type: "tab-navigate", id: tab.id, kind: "web", url: value, source: "remote" }],
+          m,
+        ),
+      ).toBe(false);
+    }
+  });
   it("coalesces rapid A/B/C URL events into the latest per-tab value", () => {
     const events = new BrowserEvents();
     events.navigation(7, "A", false, 0);
