@@ -103,9 +103,102 @@ function setup() {
   vi.mocked(sessionId).mockResolvedValue("session");
   return controller;
 }
+type TestFixture = Awaited<ReturnType<typeof fixture>>;
+interface PersistedTestState {
+  control?: { epoch: number };
+  canonical: { revision: number };
+  snapshotRequired?: { epoch: number; generation: number };
+}
+async function nextEpochTransition(
+  f: TestFixture,
+  previous: TestFixture["control"],
+  previousRoot: Uint8Array<ArrayBuffer>,
+) {
+  const epoch = previous.epoch + 1;
+  const joining = await identity();
+  const added = await makeControl(
+    {
+      ...controlBody(previous),
+      generation: previous.generation + 1,
+      previous: await controlHash(previous),
+      actor: f.device.device.id,
+      members: [f.device.device, joining.device],
+      boxes: {
+        ...previous.boxes,
+        [joining.device.id]: await wrapRoot(
+          previousRoot,
+          joining.device.exchange,
+          f.handle,
+          epoch - 1,
+          joining.device.id,
+        ),
+      },
+    },
+    f.device.signing,
+  );
+  const root = randomKey();
+  const control = await makeControl(
+    {
+      ...controlBody(added),
+      generation: added.generation + 1,
+      previous: await controlHash(added),
+      actor: f.device.device.id,
+      epoch,
+      members: [f.device.device],
+      boxes: {
+        [f.device.device.id]: await wrapRoot(
+          root,
+          f.device.device.exchange,
+          f.handle,
+          epoch,
+          f.device.device.id,
+        ),
+        recovery: await wrapRoot(root, added.recovery.exchange, f.handle, epoch, "recovery"),
+      },
+    },
+    f.device.signing,
+  );
+  const snapshot = await encryptEnvelope(
+    root,
+    f.device.signing,
+    { ...f.snapshot.header, epoch, base: f.workspace.revision },
+    f.workspace,
+  );
+  const operation: Operation = {
+    id: `epoch-${epoch}-operation`,
+    sender: f.device.device.id,
+    sequence: 1,
+    base: f.workspace.revision,
+    changes: [{ type: "window-create", id: `epoch-${epoch}-window`, order: 0 }],
+  };
+  const envelope = await encryptEnvelope(
+    root,
+    f.device.signing,
+    { ...snapshot.header, sequence: operation.sequence, base: operation.base, type: "operation" },
+    operation,
+  );
+  return { added, control, root, snapshot, envelope };
+}
+async function epochTwoTransition(f: TestFixture) {
+  return nextEpochTransition(f, f.control, f.root);
+}
+function configureEpochOne(c: Controller, f: TestFixture) {
+  Object.assign(c["local"]!, {
+    handle: f.handle,
+    device: f.device.device,
+    root: base64(f.root),
+    control: f.control,
+    canonical: f.workspace,
+  });
+  c["signing"] = f.device.signing;
+  c["exchange"] = f.device.exchange;
+}
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(100_000);
+  vi.mocked(vault.saveState).mockResolvedValue();
+  vi.mocked(vault.loadState).mockResolvedValue(undefined);
+  vi.mocked(vault.read).mockResolvedValue(undefined);
   Socket.all = [];
   vi.stubGlobal("WebSocket", Socket);
   vi.stubGlobal("__DEV__", true);
@@ -477,6 +570,246 @@ describe("controller bounded sync pull", () => {
     expect(c["local"]!.control?.epoch).toBe(2);
     expect(c["local"]!.canonical.revision).toBe(1);
     expect(c["local"]!.canonical.windows["epoch-window"]).toBeDefined();
+  });
+
+  it("requires an epoch snapshot after restart when control persistence completed first", async () => {
+    const f = await fixture();
+    const transition = await epochTwoTransition(f);
+    const persisted: PersistedTestState[] = [];
+    vi.mocked(vault.saveState).mockImplementation(async (state) => {
+      persisted.push(structuredClone(state) as PersistedTestState);
+    });
+
+    const initial = setup();
+    vi.mocked(initial.pull).mockRestore();
+    configureEpochOne(initial, f);
+    initial["auth"] = vi.fn(async (_action: string, payload: Record<string, unknown>) => {
+      if (payload.generation === 0)
+        return {
+          kind: "control",
+          chain: [transition.added, transition.control],
+          fromGeneration: 0,
+          nextGeneration: 2,
+          more: false,
+        };
+      throw new Error("simulated worker termination");
+    }) as (typeof initial)["auth"];
+
+    await expect(initial.pull()).rejects.toThrow("simulated worker termination");
+    const afterControl = persisted.at(-1)!;
+    expect(afterControl.control?.epoch).toBe(2);
+    expect(afterControl.canonical.revision).toBe(f.workspace.revision);
+    expect(afterControl.snapshotRequired).toEqual({ epoch: 2, generation: 2 });
+
+    const resumed = setup();
+    vi.mocked(resumed.pull).mockRestore();
+    resumed["local"] = structuredClone(afterControl) as (typeof resumed)["local"];
+    resumed["signing"] = f.device.signing;
+    resumed["auth"] = vi.fn(async (_action: string, payload: Record<string, unknown>) => {
+      expect(payload).toMatchObject({
+        since: f.workspace.revision,
+        generation: 2,
+        force: true,
+        pagination: true,
+      });
+      return {
+        kind: "workspace",
+        generation: 2,
+        chain: [],
+        snapshot: transition.snapshot,
+        operations: [{ revision: f.workspace.revision + 1, envelope: transition.envelope }],
+        from: f.workspace.revision,
+        next: f.workspace.revision + 1,
+        more: false,
+        revision: f.workspace.revision + 1,
+        sequence: 1,
+        pending: [],
+        presence: {},
+      };
+    }) as (typeof resumed)["auth"];
+
+    await resumed.pull();
+
+    expect(resumed["local"]!.canonical.windows["epoch-2-window"]).toBeDefined();
+    expect(
+      persisted.some(
+        (state) =>
+          state.control?.epoch === 2 &&
+          state.canonical.revision === f.workspace.revision &&
+          state.snapshotRequired === undefined,
+      ),
+    ).toBe(false);
+    const afterSnapshot = persisted.at(-1)!;
+    expect(afterSnapshot.canonical.revision).toBe(f.workspace.revision + 1);
+    expect(afterSnapshot.snapshotRequired).toBeUndefined();
+
+    const restarted = setup();
+    vi.mocked(restarted.pull).mockRestore();
+    restarted["local"] = structuredClone(afterSnapshot) as (typeof restarted)["local"];
+    restarted["signing"] = f.device.signing;
+    restarted["auth"] = vi.fn(async (_action: string, payload: Record<string, unknown>) => {
+      expect(payload).toMatchObject({ generation: 2, force: false, pagination: true });
+      return {
+        kind: "workspace",
+        generation: 2,
+        chain: [],
+        operations: [],
+        from: f.workspace.revision + 1,
+        next: f.workspace.revision + 1,
+        more: false,
+        revision: f.workspace.revision + 1,
+        sequence: 1,
+        pending: [],
+        presence: {},
+      };
+    }) as (typeof restarted)["auth"];
+    await restarted.pull();
+  });
+
+  it("retains the epoch snapshot requirement when the forced fetch fails", async () => {
+    const f = await fixture();
+    const transition = await epochTwoTransition(f);
+    const persisted: PersistedTestState[] = [];
+    vi.mocked(vault.saveState).mockImplementation(async (state) => {
+      persisted.push(structuredClone(state) as PersistedTestState);
+    });
+    const c = setup();
+    vi.mocked(c.pull).mockRestore();
+    configureEpochOne(c, f);
+    c["auth"] = vi.fn(async (_action: string, payload: Record<string, unknown>) => {
+      if (payload.generation === 0)
+        return {
+          kind: "control",
+          chain: [transition.added, transition.control],
+          fromGeneration: 0,
+          nextGeneration: 2,
+          more: false,
+        };
+      expect(payload).toMatchObject({ generation: 2, force: true });
+      throw new ApiError(503, "UNAVAILABLE", "snapshot fetch failed");
+    }) as (typeof c)["auth"];
+
+    await expect(c.pull()).rejects.toThrow("UNAVAILABLE");
+    expect(c["local"]!.snapshotRequired).toEqual({ epoch: 2, generation: 2 });
+    expect(persisted.at(-1)!.snapshotRequired).toEqual({ epoch: 2, generation: 2 });
+  });
+
+  it("retains the epoch snapshot requirement when snapshot persistence fails", async () => {
+    const f = await fixture();
+    const transition = await epochTwoTransition(f);
+    let persisted!: PersistedTestState;
+    let writes = 0;
+    vi.mocked(vault.saveState).mockImplementation(async (state) => {
+      if (writes++ > 0)
+        throw new StorageInterruptedError(new Error("simulated storage interruption"));
+      persisted = structuredClone(state) as PersistedTestState;
+    });
+    const c = setup();
+    vi.mocked(c.pull).mockRestore();
+    configureEpochOne(c, f);
+    c["auth"] = vi.fn(async (_action: string, payload: Record<string, unknown>) => {
+      if (payload.generation === 0)
+        return {
+          kind: "control",
+          chain: [transition.added, transition.control],
+          fromGeneration: 0,
+          nextGeneration: 2,
+          more: false,
+        };
+      return {
+        kind: "workspace",
+        generation: 2,
+        chain: [],
+        snapshot: transition.snapshot,
+        operations: [{ revision: 1, envelope: transition.envelope }],
+        from: 0,
+        next: 1,
+        more: false,
+        revision: 1,
+        sequence: 1,
+        pending: [],
+        presence: {},
+      };
+    }) as (typeof c)["auth"];
+
+    await expect(c.pull()).rejects.toBeInstanceOf(StorageInterruptedError);
+    expect(persisted.snapshotRequired).toEqual({ epoch: 2, generation: 2 });
+    expect(c["local"]!.snapshotRequired).toEqual({ epoch: 2, generation: 2 });
+  });
+
+  it("rejects a wrong-epoch snapshot without applying its workspace operations", async () => {
+    const f = await fixture();
+    const transition = await epochTwoTransition(f);
+    const c = setup();
+    vi.mocked(c.pull).mockRestore();
+    configureEpochOne(c, f);
+    c["auth"] = vi.fn(async (_action: string, payload: Record<string, unknown>) => {
+      if (payload.generation === 0)
+        return {
+          kind: "control",
+          chain: [transition.added, transition.control],
+          fromGeneration: 0,
+          nextGeneration: 2,
+          more: false,
+        };
+      expect(payload).toMatchObject({ generation: 2, force: true });
+      return {
+        kind: "workspace",
+        generation: 2,
+        chain: [],
+        snapshot: f.snapshot,
+        operations: [{ revision: 1, envelope: transition.envelope }],
+        from: 0,
+        next: 1,
+        more: false,
+        revision: 1,
+        sequence: 1,
+        pending: [],
+        presence: {},
+      };
+    }) as (typeof c)["auth"];
+
+    await expect(c.pull()).rejects.toThrow("Unexpected epoch snapshot.");
+    expect(c["local"]!.snapshotRequired).toEqual({ epoch: 2, generation: 2 });
+    expect(c["local"]!.canonical.windows["epoch-2-window"]).toBeUndefined();
+  });
+
+  it("keeps the latest epoch requirement when control catch-up crosses multiple rotations", async () => {
+    const f = await fixture();
+    const epochTwo = await epochTwoTransition(f);
+    const epochThree = await nextEpochTransition(f, epochTwo.control, epochTwo.root);
+    const c = setup();
+    vi.mocked(c.pull).mockRestore();
+    configureEpochOne(c, f);
+    c["auth"] = vi.fn(async (_action: string, payload: Record<string, unknown>) => {
+      if (payload.generation === 0)
+        return {
+          kind: "control",
+          chain: [epochTwo.added, epochTwo.control, epochThree.added, epochThree.control],
+          fromGeneration: 0,
+          nextGeneration: 4,
+          more: false,
+        };
+      expect(payload).toMatchObject({ generation: 4, force: true });
+      return {
+        kind: "workspace",
+        generation: 4,
+        chain: [],
+        snapshot: epochTwo.snapshot,
+        operations: [{ revision: 1, envelope: epochThree.envelope }],
+        from: 0,
+        next: 1,
+        more: false,
+        revision: 1,
+        sequence: 1,
+        pending: [],
+        presence: {},
+      };
+    }) as (typeof c)["auth"];
+
+    await expect(c.pull()).rejects.toThrow("Unexpected epoch snapshot.");
+    expect(c["local"]!.snapshotRequired).toEqual({ epoch: 3, generation: 4 });
+    expect(c["local"]!.canonical.windows["epoch-3-window"]).toBeUndefined();
   });
 
   it("reloads persisted state into a new controller and resumes a workspace page", async () => {
