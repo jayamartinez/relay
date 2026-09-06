@@ -1154,23 +1154,29 @@ describe("durable local intent recovery", () => {
       },
     ];
     s.nextSequence = 5;
-    c.lifecycle = "FETCHING_CANONICAL_STATE";
+    const persisted = structuredClone(s);
+    c["local"] = undefined;
+    c.lifecycle = "UNINITIALIZED";
+    vi.mocked(vault.loadState).mockResolvedValue(persisted);
+    vi.mocked(vault.read).mockResolvedValue({});
     const order: string[] = [];
     vi.mocked(c.pull).mockImplementation(async () => {
       order.push("pull");
     });
     vi.mocked(c.flush).mockImplementation(async (recovering = false) => {
+      if (!recovering) return;
       expect(recovering).toBe(true);
       expect(c.lifecycle).toBe("RECONCILING");
-      expect(s.queue.flatMap((entry) => entry.operation.changes)).toEqual(
+      const active = c["local"]!;
+      expect(active.queue.flatMap((entry) => entry.operation.changes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ type: "tab-move", id: "t" }),
           expect.objectContaining({ type: "tab-navigate", id: "t", url: "https://local.example/" }),
         ]),
       );
       order.push("flush");
-      s.canonical = local;
-      s.queue = [];
+      active.canonical = local;
+      active.queue = [];
       c["settleLocalIntents"]();
     });
     vi.mocked(reconcile).mockImplementation(async (target, mapping) => {
@@ -1194,11 +1200,11 @@ describe("durable local intent recovery", () => {
       },
     ]);
 
-    await c["hydrate"]();
+    await c.load();
 
     expect(order.indexOf("flush")).toBeGreaterThan(order.indexOf("pull"));
     expect(order.indexOf("reconcile")).toBeGreaterThan(order.indexOf("flush"));
-    expect(s.mapping.freshness?.intents.t).toBeUndefined();
+    expect(c["local"]!.mapping.freshness?.intents.t).toBeUndefined();
     expect(c.lifecycle).toBe("LIVE");
   });
 
