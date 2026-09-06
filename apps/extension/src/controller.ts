@@ -52,9 +52,11 @@ import {
   assert,
   canonical,
   canonicalAccount,
+  integer,
   LIMITS,
   record,
-  SYNC_MAX_PAGES_PER_PULL,
+  SYNC_MAX_CONTROL_PAGES_PER_PULL,
+  SYNC_MAX_WORKSPACE_PAGES_PER_PULL,
   serverOrigin,
   text,
 } from "@relay/shared";
@@ -133,7 +135,7 @@ interface Local {
   pairSecrets: Record<string, EphemeralState>;
   approvals: PairRequest[];
   approvalActivity?: ApprovalActivity;
-  presence: SyncReply["presence"];
+  presence: Record<string, { online: boolean; lastSeen: number }>;
   lastSynced: number;
   diagnostics: { operations: number; reconnects: number; snapshotBytes: number };
 }
@@ -1356,7 +1358,9 @@ export class Controller {
     const requestedRemoteGeneration = this.remoteChanges.snapshot();
     assert(s.control);
     let forceSnapshot = force || s.phase === "merge";
-    for (let page = 0; page < SYNC_MAX_PAGES_PER_PULL; page++) {
+    let controlPages = 0;
+    let workspacePages = 0;
+    while (true) {
       const before = s.canonical.revision;
       const reply = await this.auth<SyncReply>("sync", {
         since: before,
@@ -1365,6 +1369,22 @@ export class Controller {
         pagination: true,
       });
       forceSnapshot = false;
+      if (reply.kind === "control") {
+        if (++controlPages > SYNC_MAX_CONTROL_PAGES_PER_PULL)
+          throw new Error("Sync control catch-up exceeded the safe page limit. Relay will retry.");
+        if (await this.applyControlPage(reply, s.control.generation)) forceSnapshot = true;
+        continue;
+      }
+      if (reply.kind === "workspace") {
+        const currentControl = s.control;
+        assert(currentControl);
+        assert(
+          reply.generation === currentControl.generation && reply.chain.length === 0,
+          "Membership state mismatch.",
+        );
+      }
+      if (++workspacePages > SYNC_MAX_WORKSPACE_PAGES_PER_PULL)
+        throw new Error("Sync catch-up exceeded the safe page limit. Relay will retry.");
       const result = await this.applySyncPage(reply, before, requestedRemoteGeneration);
       if (result === "complete") return;
       // A changed epoch at an already-current revision requires an authenticated
@@ -1375,7 +1395,30 @@ export class Controller {
       }
       assert(s.canonical.revision > before, "Sync continuation made no progress.");
     }
-    throw new Error("Sync catch-up exceeded the safe page limit. Relay will retry.");
+  }
+  private async applyControlPage(reply: SyncReply, requestedGeneration: number): Promise<boolean> {
+    const s = this.require();
+    const nextGeneration = integer(reply.nextGeneration);
+    assert(
+      reply.kind === "control" &&
+        Array.isArray(reply.chain) &&
+        reply.chain.length > 0 &&
+        reply.chain.length <= LIMITS.control &&
+        Number.isSafeInteger(reply.fromGeneration) &&
+        Number.isSafeInteger(nextGeneration) &&
+        typeof reply.more === "boolean" &&
+        reply.fromGeneration === requestedGeneration &&
+        nextGeneration > requestedGeneration,
+      "Invalid control continuation.",
+    );
+    const previousEpoch = s.control?.epoch;
+    await this.advanceChain(reply.chain);
+    assert(
+      s.control && s.control.generation === nextGeneration,
+      "Invalid control continuation range.",
+    );
+    await this.persist();
+    return previousEpoch !== s.control.epoch;
   }
   private async applySyncPage(
     reply: SyncReply,
@@ -1387,17 +1430,32 @@ export class Controller {
       Array.isArray(reply.chain) &&
         reply.chain.length <= LIMITS.control &&
         Array.isArray(reply.operations) &&
-        reply.operations.length <= LIMITS.operations,
+        reply.operations.length <= LIMITS.operations &&
+        Number.isSafeInteger(reply.revision) &&
+        Number.isSafeInteger(reply.sequence) &&
+        Array.isArray(reply.pending) &&
+        reply.pending.length <= LIMITS.pending &&
+        reply.presence,
     );
+    const operations = reply.operations!;
+    const revision = integer(reply.revision);
+    const sequence = integer(reply.sequence);
+    const pending = reply.pending!;
+    const presence = reply.presence!;
     const previousControl = s.control;
     assert(previousControl);
     const oldEpoch = previousControl.epoch;
-    await this.advanceChain(reply.chain);
-    assert(
-      s.control && canonical(parseControl(reply.control)) === canonical(s.control),
-      "Membership state mismatch.",
-    );
-    if (oldEpoch !== s.control.epoch && !reply.snapshot) {
+    if (reply.kind !== "workspace") {
+      assert(reply.control);
+      await this.advanceChain(reply.chain);
+      assert(
+        s.control && canonical(parseControl(reply.control)) === canonical(s.control),
+        "Membership state mismatch.",
+      );
+    }
+    const currentControl = s.control;
+    assert(currentControl);
+    if (oldEpoch !== currentControl.epoch && !reply.snapshot) {
       // Do not apply a page encrypted under an epoch whose authenticated
       // snapshot was not supplied. The caller immediately retries with force.
       return "snapshot";
@@ -1406,7 +1464,6 @@ export class Controller {
       Number.isSafeInteger(reply.from) &&
       Number.isSafeInteger(reply.next) &&
       typeof reply.more === "boolean";
-    assert(Number.isSafeInteger(reply.revision), "Invalid workspace revision.");
     if (bounded)
       assert(
         reply.from === requestedSince || reply.snapshot !== undefined,
@@ -1437,13 +1494,13 @@ export class Controller {
     // remains safe to accept only after the existing full-revision checks; an
     // oversized legacy body is still stopped by Api's response-size guard.
     const from = bounded ? reply.from : canonicalState.revision;
-    const next = bounded ? reply.next : reply.revision;
+    const next = bounded ? integer(reply.next) : revision;
     const more = bounded ? reply.more : false;
     assert(
-      from === canonicalState.revision && next >= from && next <= reply.revision,
+      from === canonicalState.revision && next >= from && next <= revision,
       "Invalid sync continuation range.",
     );
-    for (const row of reply.operations) {
+    for (const row of operations) {
       assert(row.revision === canonicalState.revision + 1, "Missing workspace revision.");
       const envelope = parseEnvelope(row.envelope);
       assert(envelope.header.type === "operation");
@@ -1460,9 +1517,9 @@ export class Controller {
       canonicalState = applyOperation(canonicalState, operation, row.revision);
     }
     assert(canonicalState.revision === next, "Workspace page revision mismatch.");
-    assert(more === next < reply.revision, "Invalid sync continuation state.");
+    assert(more === next < revision, "Invalid sync continuation state.");
     assert(
-      reply.sequence >= (canonicalState.sequences[s.device.id] ?? 0),
+      sequence >= (canonicalState.sequences[s.device.id] ?? 0),
       "Unverified journal acknowledgment rejected.",
     );
     s.canonical = canonicalState;
@@ -1471,17 +1528,16 @@ export class Controller {
     // locally queued operations or acknowledging them prematurely.
     await this.persist();
     if (more) return "more";
-    assert(canonicalState.revision === reply.revision, "Workspace revision mismatch.");
+    assert(canonicalState.revision === revision, "Workspace revision mismatch.");
     assert(
-      reply.sequence === (canonicalState.sequences[s.device.id] ?? 0),
+      sequence === (canonicalState.sequences[s.device.id] ?? 0),
       "Unverified journal acknowledgment rejected.",
     );
-    s.queue = s.queue.filter((q) => q.sequence > reply.sequence);
+    s.queue = s.queue.filter((q) => q.sequence > sequence);
     this.settleLocalIntents();
     this.pruneLocalGroupState();
-    s.nextSequence = Math.max(s.nextSequence, reply.sequence + 1);
-    assert(Array.isArray(reply.pending) && reply.pending.length <= LIMITS.pending);
-    s.approvals = reply.pending.map(parsePair);
+    s.nextSequence = Math.max(s.nextSequence, sequence + 1);
+    s.approvals = pending.map(parsePair);
     this.reconcileApprovalActivity();
     for (const requestId of Object.keys(s.pairSecrets))
       if (requestId !== s.request?.id && !s.approvals.some((p) => p.id === requestId)) {
@@ -1502,7 +1558,7 @@ export class Controller {
         "Pairing approver changed after commitment.",
       );
     }
-    s.presence = reply.presence;
+    s.presence = presence;
     s.lastSynced = Date.now();
     this.remoteChanges.acknowledge(requestedRemoteGeneration);
     this.lastApprovalRefresh = Date.now();

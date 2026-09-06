@@ -1,5 +1,13 @@
-import { base64, encryptEnvelope } from "@relay/crypto";
-import { emptyWorkspace, type Operation, type SyncReply } from "@relay/protocol";
+import {
+  base64,
+  controlHash,
+  encryptEnvelope,
+  identity,
+  makeControl,
+  randomKey,
+  wrapRoot,
+} from "@relay/crypto";
+import { controlBody, emptyWorkspace, type Operation, type SyncReply } from "@relay/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixture } from "../../../tests/fixtures";
 import { ApiError } from "./api";
@@ -353,6 +361,229 @@ describe("controller bounded sync pull", () => {
       presence: {},
     })) as (typeof c)["auth"];
     await expect(c.pull()).resolves.toBeUndefined();
+  });
+
+  it("validates paged controls before decrypting a new-epoch snapshot and operation", async () => {
+    const f = await fixture();
+    const c = setup();
+    vi.mocked(c.pull).mockRestore();
+    const joining = await identity();
+    const added = await makeControl(
+      {
+        ...controlBody(f.control),
+        generation: 1,
+        previous: await controlHash(f.control),
+        actor: f.device.device.id,
+        members: [f.device.device, joining.device],
+        boxes: {
+          ...f.control.boxes,
+          [joining.device.id]: await wrapRoot(
+            f.root,
+            joining.device.exchange,
+            f.handle,
+            1,
+            joining.device.id,
+          ),
+        },
+      },
+      f.device.signing,
+    );
+    const rotatedRoot = randomKey();
+    const rotated = await makeControl(
+      {
+        ...controlBody(added),
+        generation: 2,
+        previous: await controlHash(added),
+        actor: f.device.device.id,
+        epoch: 2,
+        members: [f.device.device],
+        boxes: {
+          [f.device.device.id]: await wrapRoot(
+            rotatedRoot,
+            f.device.device.exchange,
+            f.handle,
+            2,
+            f.device.device.id,
+          ),
+          recovery: await wrapRoot(rotatedRoot, added.recovery.exchange, f.handle, 2, "recovery"),
+        },
+      },
+      f.device.signing,
+    );
+    const snapshot = await encryptEnvelope(
+      rotatedRoot,
+      f.device.signing,
+      { ...f.snapshot.header, epoch: 2 },
+      f.workspace,
+    );
+    const operation: Operation = {
+      id: "epoch-two",
+      sender: f.device.device.id,
+      sequence: 1,
+      base: 0,
+      changes: [{ type: "window-create", id: "epoch-window", order: 0 }],
+    };
+    const envelope = await encryptEnvelope(
+      rotatedRoot,
+      f.device.signing,
+      { ...snapshot.header, sequence: 1, base: 0, type: "operation" },
+      operation,
+    );
+    Object.assign(c["local"]!, {
+      handle: f.handle,
+      device: f.device.device,
+      root: base64(f.root),
+      control: f.control,
+      canonical: f.workspace,
+    });
+    c["signing"] = f.device.signing;
+    c["exchange"] = f.device.exchange;
+    c["auth"] = vi.fn(async (_action: string, payload: Record<string, unknown>) => {
+      if (payload.generation === 0)
+        return {
+          kind: "control",
+          chain: [added],
+          fromGeneration: 0,
+          nextGeneration: 1,
+          more: true,
+        };
+      if (payload.generation === 1)
+        return {
+          kind: "control",
+          chain: [rotated],
+          fromGeneration: 1,
+          nextGeneration: 2,
+          more: false,
+        };
+      expect(payload).toMatchObject({ generation: 2, force: true, pagination: true });
+      return {
+        kind: "workspace",
+        generation: 2,
+        chain: [],
+        snapshot,
+        operations: [{ revision: 1, envelope }],
+        from: 0,
+        next: 1,
+        more: false,
+        revision: 1,
+        sequence: 1,
+        pending: [],
+        presence: {},
+      };
+    }) as (typeof c)["auth"];
+
+    await c.pull();
+
+    expect(c["local"]!.control?.epoch).toBe(2);
+    expect(c["local"]!.canonical.revision).toBe(1);
+    expect(c["local"]!.canonical.windows["epoch-window"]).toBeDefined();
+  });
+
+  it("reloads persisted state into a new controller and resumes a workspace page", async () => {
+    const f = await fixture();
+    const queued: Operation = {
+      id: "queued-after-restart",
+      sender: f.device.device.id,
+      sequence: 3,
+      base: 0,
+      changes: [{ type: "window-create", id: "queued-window", order: 0 }],
+    };
+    const operations: Operation[] = [
+      {
+        id: "before-restart",
+        sender: f.device.device.id,
+        sequence: 1,
+        base: 0,
+        changes: [{ type: "window-create", id: "first-window", order: 0 }],
+      },
+      {
+        id: "after-restart",
+        sender: f.device.device.id,
+        sequence: 2,
+        base: 1,
+        changes: [{ type: "window-delete", id: "first-window" }],
+      },
+    ];
+    const envelopes = await Promise.all(
+      operations.map((operation) =>
+        encryptEnvelope(
+          f.root,
+          f.device.signing,
+          {
+            version: 1,
+            account: f.handle,
+            epoch: 1,
+            sender: f.device.device.id,
+            sequence: operation.sequence,
+            base: operation.base,
+            type: "operation",
+          },
+          operation,
+        ),
+      ),
+    );
+    let persisted: unknown;
+    vi.mocked(vault.saveState).mockImplementation(async (state) => {
+      persisted = structuredClone(state);
+    });
+    const initial = setup();
+    vi.mocked(initial.pull).mockRestore();
+    Object.assign(initial["local"]!, {
+      handle: f.handle,
+      device: f.device.device,
+      root: base64(f.root),
+      control: f.control,
+      canonical: f.workspace,
+      queue: [{ sequence: 3, operation: queued }],
+      nextSequence: 4,
+    });
+    initial["signing"] = f.device.signing;
+    initial["auth"] = vi.fn(async (_action: string, payload: Record<string, unknown>) => {
+      if (payload.since === 0)
+        return {
+          kind: "workspace",
+          generation: 0,
+          chain: [],
+          operations: [{ revision: 1, envelope: envelopes[0]! }],
+          from: 0,
+          next: 1,
+          more: true,
+          revision: 2,
+          sequence: 2,
+          pending: [],
+          presence: {},
+        };
+      throw new Error("simulated worker termination");
+    }) as (typeof initial)["auth"];
+    await expect(initial.pull()).rejects.toThrow("simulated worker termination");
+    expect((persisted as { canonical: { revision: number } }).canonical.revision).toBe(1);
+
+    const resumed = setup();
+    vi.mocked(resumed.pull).mockRestore();
+    resumed["local"] = structuredClone(persisted) as (typeof resumed)["local"];
+    resumed["signing"] = f.device.signing;
+    resumed["auth"] = vi.fn(async (_action: string, payload: Record<string, unknown>) => {
+      expect(payload).toMatchObject({ since: 1, generation: 0, pagination: true });
+      return {
+        kind: "workspace",
+        generation: 0,
+        chain: [],
+        operations: [{ revision: 2, envelope: envelopes[1]! }],
+        from: 1,
+        next: 2,
+        more: false,
+        revision: 2,
+        sequence: 2,
+        pending: [],
+        presence: {},
+      };
+    }) as (typeof resumed)["auth"];
+
+    await resumed.pull();
+
+    expect(resumed["local"]!.canonical.revision).toBe(2);
+    expect(resumed["local"]!.canonical.windows).toEqual({});
+    expect(resumed["local"]!.queue).toEqual([{ sequence: 3, operation: queued }]);
   });
 });
 

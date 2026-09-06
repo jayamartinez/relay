@@ -17,7 +17,11 @@ export const SYNC_CLIENT_RESPONSE_BYTE_LIMIT = LIMITS.message * 4;
 // unreadable response. A legal request/envelope remains capped at 2,000,000
 // bytes, so one operation has ample room in this 6 MB page.
 export const SYNC_RESPONSE_BYTE_BUDGET = 6_000_000;
-export const SYNC_MAX_PAGES_PER_PULL = LIMITS.operations + 1;
+// Control and workspace histories have independent finite limits. Keeping
+// their page caps separate guarantees a maximum legal control chain cannot
+// consume the operation catch-up budget.
+export const SYNC_MAX_CONTROL_PAGES_PER_PULL = LIMITS.control;
+export const SYNC_MAX_WORKSPACE_PAGES_PER_PULL = LIMITS.operations + 1;
 export function assert(condition: unknown, message = "Invalid protocol data"): asserts condition {
   if (!condition) throw new Error(message);
 }

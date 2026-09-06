@@ -363,6 +363,109 @@ describe("SQLite Durable Object", () => {
     expect(second.reply.next).toBe(6);
     expect(second.reply.more).toBe(false);
   });
+  it("pages a legal signed control chain before returning workspace state", async () => {
+    const f = await client();
+    const joining = await identity();
+    const recovery = await recoverIdentity(f.secret, f.handle, f.control.recovery);
+    const added = await makeControl(
+      {
+        ...controlBody(f.control),
+        generation: 1,
+        previous: await controlHash(f.control),
+        actor: "recovery",
+        members: [f.device.device, joining.device],
+        boxes: {
+          ...f.control.boxes,
+          [joining.device.id]: await wrapRoot(
+            f.root,
+            joining.device.exchange,
+            f.handle,
+            1,
+            joining.device.id,
+          ),
+        },
+      },
+      recovery.signing,
+    );
+    expect(
+      (await f.auth("recover-join", { control: added }, "recovery", recovery.signing)).status,
+    ).toBe(200);
+    const rotatedRoot = randomKey();
+    const rotated = await makeControl(
+      {
+        ...controlBody(added),
+        generation: 2,
+        previous: await controlHash(added),
+        actor: f.device.device.id,
+        epoch: 2,
+        members: [f.device.device],
+        boxes: {
+          [f.device.device.id]: await wrapRoot(
+            rotatedRoot,
+            f.device.device.exchange,
+            f.handle,
+            2,
+            f.device.device.id,
+          ),
+          recovery: await wrapRoot(rotatedRoot, added.recovery.exchange, f.handle, 2, "recovery"),
+        },
+      },
+      f.device.signing,
+    );
+    const snapshot = await encryptEnvelope(
+      rotatedRoot,
+      f.device.signing,
+      { ...f.snapshot.header, epoch: 2 },
+      f.workspace,
+    );
+    expect((await f.auth("rotate", { control: rotated, snapshot })).status).toBe(200);
+
+    const controlBytes = Math.max(
+      new TextEncoder().encode(JSON.stringify(added)).byteLength,
+      new TextEncoder().encode(JSON.stringify(rotated)).byteLength,
+    );
+    const testEnv = env as unknown as { SYNC_RESPONSE_BYTE_BUDGET?: string };
+    testEnv.SYNC_RESPONSE_BYTE_BUDGET = String(controlBytes + 400);
+    try {
+      expect((await f.auth("sync", { since: 0, generation: 0 })).status).toBe(409);
+      const firstResponse = await f.auth("sync", { since: 0, generation: 0, pagination: true });
+      const firstBytes = await responseBytes(firstResponse);
+      const first = await firstResponse.json<SyncReply>();
+      expect(firstResponse.status).toBe(200);
+      expect(first.kind).toBe("control");
+      expect(first.chain).toHaveLength(1);
+      expect(first.fromGeneration).toBe(0);
+      expect(first.nextGeneration).toBe(1);
+      expect(first.more).toBe(true);
+      expect(firstBytes).toBeLessThanOrEqual(controlBytes + 400);
+
+      const secondResponse = await f.auth("sync", { since: 0, generation: 1, pagination: true });
+      const secondBytes = await responseBytes(secondResponse);
+      const second = await secondResponse.json<SyncReply>();
+      expect(secondResponse.status).toBe(200);
+      expect(second.kind).toBe("control");
+      expect(second.chain).toHaveLength(1);
+      expect(second.fromGeneration).toBe(1);
+      expect(second.nextGeneration).toBe(2);
+      expect(second.more).toBe(false);
+      expect(secondBytes).toBeLessThanOrEqual(controlBytes + 400);
+
+      delete testEnv.SYNC_RESPONSE_BYTE_BUDGET;
+      const workspaceResponse = await f.auth("sync", {
+        since: 0,
+        generation: 2,
+        pagination: true,
+        force: true,
+      });
+      const workspace = await workspaceResponse.json<SyncReply>();
+      expect(workspaceResponse.status).toBe(200);
+      expect(workspace.kind).toBe("workspace");
+      expect(workspace.generation).toBe(2);
+      expect(workspace.snapshot?.header.epoch).toBe(2);
+    } finally {
+      delete testEnv.SYNC_RESPONSE_BYTE_BUDGET;
+    }
+  });
   it("recovers authorization, rotates keys, and rejects revoked signers", async () => {
     const f = await client();
     const b = await identity();

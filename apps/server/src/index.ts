@@ -32,6 +32,9 @@ interface Env {
   ACCOUNTS: DurableObjectNamespace<RelayAccount>;
   EDGE_LIMIT: RateLimit;
   ENROLL_LIMIT: RateLimit;
+  // Optional lower test/staging budget. It can never raise the production
+  // contract above the shared safe default.
+  SYNC_RESPONSE_BYTE_BUDGET?: string;
 }
 interface Meta {
   control: Control;
@@ -98,6 +101,15 @@ export class RelayAccount extends DurableObject<Env> {
       .exec<{ value: string }>("SELECT value FROM state WHERE key = ?", key)
       .toArray()[0];
     return row ? (JSON.parse(row.value) as T) : undefined;
+  }
+  private syncResponseBudget() {
+    if (this.env.SYNC_RESPONSE_BYTE_BUDGET === undefined) return SYNC_RESPONSE_BYTE_BUDGET;
+    const configured = Number(this.env.SYNC_RESPONSE_BYTE_BUDGET);
+    assert(
+      Number.isSafeInteger(configured) && configured > 0 && configured <= SYNC_RESPONSE_BYTE_BUDGET,
+      "Invalid sync response budget.",
+    );
+    return configured;
   }
   private put(key: string, value: unknown) {
     this.ctx.storage.sql.exec(
@@ -420,6 +432,17 @@ export class RelayAccount extends DurableObject<Env> {
       const generation = Number(p.generation);
       assert(Number.isInteger(generation) && generation >= -1);
       if (since > meta.revision) fail(409, "Sync continuation is ahead of the server.");
+      const pagination = p.pagination === true;
+      const responseBudget = this.syncResponseBudget();
+      const controls = this.controlPage(generation, meta.control.generation);
+      if (controls.chain.length) {
+        // Control entries authenticate membership and root provisioning. A
+        // pagination-capable client validates/persists these pages before it is
+        // ever sent workspace ciphertext for the resulting epoch.
+        if (pagination) return json(controls);
+        if (controls.more)
+          fail(409, "Update Relay to continue this bounded sync.", "SYNC_PAGINATION_REQUIRED");
+      }
       const snapshot =
         since < meta.snapshot.header.base || p.force === true ? meta.snapshot : undefined;
       const from = snapshot ? snapshot.header.base : since;
@@ -430,8 +453,9 @@ export class RelayAccount extends DurableObject<Env> {
           lastSeen: this.get<number>(`seen:${device.id}`) ?? 0,
         };
       const reply = {
-        control: meta.control,
-        chain: this.chain(generation),
+        ...(pagination
+          ? { kind: "workspace" as const, generation: meta.control.generation, chain: [] }
+          : { control: meta.control, chain: controls.chain }),
         snapshot,
         revision: meta.revision,
         sequence: this.get<number>(`seq:${actor}`) ?? 0,
@@ -448,8 +472,11 @@ export class RelayAccount extends DurableObject<Env> {
         next: Number.MAX_SAFE_INTEGER,
         more: false,
       });
-      if (emptyPageBytes > SYNC_RESPONSE_BYTE_BUDGET)
+      if (emptyPageBytes > responseBudget) {
+        if (!pagination)
+          fail(409, "Update Relay to continue this bounded sync.", "SYNC_PAGINATION_REQUIRED");
         fail(413, "Sync metadata exceeds the response budget.", "SYNC_RESPONSE_TOO_LARGE");
+      }
       const operations: OperationRow[] = [];
       let operationBytes = 0;
       for (const row of this.ctx.storage.sql.exec<{ revision: number; envelope: string }>(
@@ -459,10 +486,7 @@ export class RelayAccount extends DurableObject<Env> {
         const operation = { revision: row.revision, envelope: JSON.parse(row.envelope) };
         const serializedBytes = jsonBytes(operation);
         const delimiterBytes = operations.length ? 1 : 0;
-        if (
-          emptyPageBytes + operationBytes + delimiterBytes + serializedBytes >
-          SYNC_RESPONSE_BYTE_BUDGET
-        ) {
+        if (emptyPageBytes + operationBytes + delimiterBytes + serializedBytes > responseBudget) {
           if (!operations.length)
             fail(
               413,
@@ -478,12 +502,12 @@ export class RelayAccount extends DurableObject<Env> {
       const more = next < meta.revision;
       // Older v1 clients do not understand a partial reply and would reject it
       // after receiving it. Refuse safely instead of sending an oversized body.
-      if (more && p.pagination !== true)
+      if (more && !pagination)
         fail(409, "Update Relay to continue this bounded sync.", "SYNC_PAGINATION_REQUIRED");
       const page = { ...reply, operations, next, more };
       // The conservative estimate above should make this unreachable; retain an
       // exact final assertion against future response-shape changes.
-      if (jsonBytes(page) > SYNC_RESPONSE_BYTE_BUDGET)
+      if (jsonBytes(page) > responseBudget)
         fail(413, "Sync response exceeds the response budget.", "SYNC_RESPONSE_TOO_LARGE");
       return json(page);
     }
@@ -624,6 +648,46 @@ export class RelayAccount extends DurableObject<Env> {
       )
       .toArray()
       .map((row) => JSON.parse(row.value) as Control);
+  }
+  private controlPage(fromGeneration: number, currentGeneration: number) {
+    const responseBudget = this.syncResponseBudget();
+    const base = {
+      kind: "control" as const,
+      chain: [],
+      fromGeneration,
+      nextGeneration: Number.MAX_SAFE_INTEGER,
+      more: false,
+    };
+    const emptyPageBytes = jsonBytes(base);
+    if (emptyPageBytes > responseBudget)
+      fail(413, "Sync control metadata exceeds the response budget.", "SYNC_RESPONSE_TOO_LARGE");
+    const chain: Control[] = [];
+    let chainBytes = 0;
+    for (const row of this.ctx.storage.sql.exec<{ generation: number; value: string }>(
+      "SELECT generation,value FROM controls WHERE generation > ? ORDER BY generation",
+      fromGeneration,
+    )) {
+      const control = JSON.parse(row.value) as Control;
+      const serializedBytes = jsonBytes(control);
+      const delimiterBytes = chain.length ? 1 : 0;
+      if (emptyPageBytes + chainBytes + delimiterBytes + serializedBytes > responseBudget) {
+        if (!chain.length)
+          fail(
+            413,
+            "One control entry exceeds the sync response budget.",
+            "SYNC_CONTROL_TOO_LARGE",
+          );
+        break;
+      }
+      chainBytes += delimiterBytes + serializedBytes;
+      chain.push(control);
+    }
+    const nextGeneration = chain.at(-1)?.generation ?? fromGeneration;
+    const more = nextGeneration < currentGeneration;
+    const page = { kind: "control" as const, chain, fromGeneration, nextGeneration, more };
+    if (jsonBytes(page) > responseBudget)
+      fail(413, "Sync control response exceeds the response budget.", "SYNC_RESPONSE_TOO_LARGE");
+    return page;
   }
   private socket(url: URL, request: Request): Response {
     assert(request.headers.get("Upgrade")?.toLowerCase() === "websocket");
