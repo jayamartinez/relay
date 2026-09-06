@@ -330,6 +330,30 @@ describe("controller bounded sync pull", () => {
     })) as (typeof c)["auth"];
     await expect(c.pull()).rejects.toThrow("Sync continuation made no progress.");
   });
+
+  it("accepts a complete under-limit legacy sync response", async () => {
+    const f = await fixture();
+    const c = setup();
+    vi.mocked(c.pull).mockRestore();
+    Object.assign(c["local"]!, {
+      handle: f.handle,
+      device: f.device.device,
+      root: base64(f.root),
+      control: f.control,
+      canonical: f.workspace,
+    });
+    c["signing"] = f.device.signing;
+    c["auth"] = vi.fn(async () => ({
+      control: f.control,
+      chain: [],
+      operations: [],
+      revision: 0,
+      sequence: 0,
+      pending: [],
+      presence: {},
+    })) as (typeof c)["auth"];
+    await expect(c.pull()).resolves.toBeUndefined();
+  });
 });
 
 it("retains consumed close/navigation evidence after a transient capture failure; later browser and socket tasks run", async () => {

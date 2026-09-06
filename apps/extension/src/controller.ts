@@ -1402,17 +1402,16 @@ export class Controller {
       // snapshot was not supplied. The caller immediately retries with force.
       return "snapshot";
     }
-    assert(
+    const bounded =
       Number.isSafeInteger(reply.from) &&
-        Number.isSafeInteger(reply.next) &&
-        Number.isSafeInteger(reply.revision) &&
-        typeof reply.more === "boolean",
-      "Server does not support bounded sync responses.",
-    );
-    assert(
-      reply.from === requestedSince || reply.snapshot !== undefined,
-      "Invalid sync continuation start.",
-    );
+      Number.isSafeInteger(reply.next) &&
+      typeof reply.more === "boolean";
+    assert(Number.isSafeInteger(reply.revision), "Invalid workspace revision.");
+    if (bounded)
+      assert(
+        reply.from === requestedSince || reply.snapshot !== undefined,
+        "Invalid sync continuation start.",
+      );
     let canonicalState = s.canonical;
     const decrypt = async (envelope: Envelope) => {
       const member = s.control?.members.find((d) => d.id === envelope.header.sender);
@@ -1434,10 +1433,14 @@ export class Controller {
       canonicalState = parseWorkspace(await decrypt(snapshot));
       assert(canonicalState.revision === snapshot.header.base);
     }
+    // Older servers return one complete page without continuation fields. It
+    // remains safe to accept only after the existing full-revision checks; an
+    // oversized legacy body is still stopped by Api's response-size guard.
+    const from = bounded ? reply.from : canonicalState.revision;
+    const next = bounded ? reply.next : reply.revision;
+    const more = bounded ? reply.more : false;
     assert(
-      reply.from === canonicalState.revision &&
-        reply.next >= reply.from &&
-        reply.next <= reply.revision,
+      from === canonicalState.revision && next >= from && next <= reply.revision,
       "Invalid sync continuation range.",
     );
     for (const row of reply.operations) {
@@ -1456,8 +1459,8 @@ export class Controller {
       );
       canonicalState = applyOperation(canonicalState, operation, row.revision);
     }
-    assert(canonicalState.revision === reply.next, "Workspace page revision mismatch.");
-    assert(reply.more === reply.next < reply.revision, "Invalid sync continuation state.");
+    assert(canonicalState.revision === next, "Workspace page revision mismatch.");
+    assert(more === next < reply.revision, "Invalid sync continuation state.");
     assert(
       reply.sequence >= (canonicalState.sequences[s.device.id] ?? 0),
       "Unverified journal acknowledgment rejected.",
@@ -1467,7 +1470,7 @@ export class Controller {
     // next signed request resumes from this canonical revision without losing
     // locally queued operations or acknowledging them prematurely.
     await this.persist();
-    if (reply.more) return "more";
+    if (more) return "more";
     assert(canonicalState.revision === reply.revision, "Workspace revision mismatch.");
     assert(
       reply.sequence === (canonicalState.sequences[s.device.id] ?? 0),
