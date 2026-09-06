@@ -194,14 +194,26 @@ export interface OperationRow {
   envelope: Envelope;
 }
 export interface SyncReply {
-  control: Control;
+  // Pagination-capable peers receive either a control page or a workspace
+  // page. Legacy complete replies omit `kind` and retain control + chain.
+  kind?: "control" | "workspace";
+  control?: Control;
   chain: Control[];
+  generation?: number;
+  fromGeneration?: number;
+  nextGeneration?: number;
   snapshot?: Envelope;
-  operations: OperationRow[];
-  revision: number;
-  sequence: number;
-  pending: PairRequest[];
-  presence: Record<string, { online: boolean; lastSeen: number }>;
+  operations?: OperationRow[];
+  // `from` is the revision represented by the snapshot (if supplied), or the
+  // requested revision. Operations then cover the contiguous range through
+  // `next`. `revision` remains the server's latest revision for this reply.
+  from?: number;
+  next?: number;
+  more?: boolean;
+  revision?: number;
+  sequence?: number;
+  pending?: PairRequest[];
+  presence?: Record<string, { online: boolean; lastSeen: number }>;
 }
 export function emptyWorkspace(): Workspace {
   return {
