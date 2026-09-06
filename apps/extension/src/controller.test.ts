@@ -1065,3 +1065,203 @@ it("retries an interrupted durable load on the next alarm without replacing iden
   await c.browserChanged();
   expect(capture).toHaveBeenCalled();
 });
+
+describe("durable local intent recovery", () => {
+  const workspace = (url: string) => ({
+    ...emptyWorkspace(),
+    revision: 435,
+    windows: { w: { id: "w", order: 0, changed: 1 } },
+    tabs: {
+      t: {
+        id: "t",
+        window: "w",
+        index: 0,
+        pinned: false,
+        kind: "web" as const,
+        url,
+        changed: 1,
+        writer: "remote",
+        source: "remote",
+      },
+    },
+  });
+
+  it("does not journal or retire navigation intent for an unrelated tab move", async () => {
+    const c = setup();
+    const s = c["local"]!;
+    s.canonical = workspace("https://remote.example/");
+    s.mapping.observed = workspace("https://local.example/");
+    s.mapping.freshness = {
+      generation: 1,
+      intents: {
+        t: {
+          generation: 1,
+          kind: "navigate",
+          url: "https://local.example/",
+          canonicalRevision: 435,
+        },
+      },
+    };
+
+    await c["enqueue"]([{ type: "tab-move", id: "t", window: "w", index: 0 }]);
+    expect(s.mapping.freshness.intents.t!.journaled).toBeUndefined();
+    s.queue = [];
+    s.mapping.freshness.intents.t!.journaled = true; // Legacy persisted state.
+    c["settleLocalIntents"]();
+    expect(s.mapping.freshness.intents.t).toBeDefined();
+
+    await c["journalDurableIntents"]();
+    expect(s.queue.at(-1)!.operation.changes).toEqual([
+      expect.objectContaining({ type: "tab-navigate", id: "t", url: "https://local.example/" }),
+    ]);
+  });
+
+  it("pushes a persisted local intent before recovery reconciliation, then reaches Live", async () => {
+    const c = setup();
+    const s = c["local"]!;
+    const remote = workspace("https://remote.example/");
+    const local = workspace("https://local.example/");
+    s.canonical = remote;
+    s.mapping = {
+      session: "session",
+      windows: { 1: "w" },
+      tabs: { 9: "t" },
+      expected: [],
+      observed: local,
+      freshness: {
+        generation: 4,
+        intents: {
+          t: {
+            generation: 4,
+            kind: "navigate",
+            url: "https://local.example/",
+            canonicalRevision: 435,
+            journaled: true,
+          },
+        },
+      },
+    };
+    s.queue = [
+      {
+        sequence: 4,
+        operation: {
+          id: "move",
+          sender: s.device.id,
+          sequence: 4,
+          base: 435,
+          changes: [{ type: "tab-move", id: "t", window: "w", index: 0 }],
+        },
+      },
+    ];
+    s.nextSequence = 5;
+    c.lifecycle = "FETCHING_CANONICAL_STATE";
+    const order: string[] = [];
+    vi.mocked(c.pull).mockImplementation(async () => {
+      order.push("pull");
+    });
+    vi.mocked(c.flush).mockImplementation(async (recovering = false) => {
+      expect(recovering).toBe(true);
+      expect(c.lifecycle).toBe("RECONCILING");
+      expect(s.queue.flatMap((entry) => entry.operation.changes)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "tab-move", id: "t" }),
+          expect.objectContaining({ type: "tab-navigate", id: "t", url: "https://local.example/" }),
+        ]),
+      );
+      order.push("flush");
+      s.canonical = local;
+      s.queue = [];
+      c["settleLocalIntents"]();
+    });
+    vi.mocked(reconcile).mockImplementation(async (target, mapping) => {
+      order.push("reconcile");
+      expect(target.tabs.t!.url).toBe("https://local.example/");
+      return { ...mapping, observed: target };
+    });
+    vi.mocked(browserWindows).mockResolvedValue([
+      {
+        local: 1,
+        tabs: [
+          {
+            local: 9,
+            window: 1,
+            index: 0,
+            pinned: false,
+            incognito: false,
+            url: "https://local.example/",
+          },
+        ],
+      },
+    ]);
+
+    await c["hydrate"]();
+
+    expect(order.indexOf("flush")).toBeGreaterThan(order.indexOf("pull"));
+    expect(order.indexOf("reconcile")).toBeGreaterThan(order.indexOf("flush"));
+    expect(s.mapping.freshness?.intents.t).toBeUndefined();
+    expect(c.lifecycle).toBe("LIVE");
+  });
+
+  it("repairs and retires a durable delete intent only after canonical deletion", async () => {
+    const c = setup();
+    const s = c["local"]!;
+    s.canonical = workspace("https://remote.example/");
+    s.mapping.freshness = {
+      generation: 1,
+      intents: { t: { generation: 1, kind: "delete", canonicalRevision: 435, journaled: true } },
+    };
+
+    await c["journalDurableIntents"]();
+    expect(s.queue.at(-1)!.operation.changes).toEqual([{ type: "tab-delete", id: "t" }]);
+    s.queue = [];
+    c["settleLocalIntents"]();
+    expect(s.mapping.freshness.intents.t).toBeDefined();
+    delete s.canonical.tabs.t;
+    c["settleLocalIntents"]();
+    expect(s.mapping.freshness.intents.t).toBeUndefined();
+  });
+
+  it("validates by pulling before a recovery push and preserves failed work", async () => {
+    const f = await fixture();
+    const c = setup();
+    configureEpochOne(c, f);
+    const s = c["local"]!;
+    s.queue = [
+      {
+        sequence: 1,
+        operation: {
+          id: "local-navigation",
+          sender: s.device.id,
+          sequence: 1,
+          base: s.canonical.revision,
+          changes: [
+            {
+              type: "tab-navigate",
+              id: Object.keys(s.canonical.tabs)[0]!,
+              kind: "web",
+              url: "https://local.example/",
+              source: s.device.id,
+            },
+          ],
+        },
+      },
+    ];
+    c.lifecycle = "RECONCILING";
+    vi.mocked(c.flush).mockRestore();
+    const order: string[] = [];
+    vi.mocked(c.pull).mockImplementation(async () => {
+      order.push("pull");
+    });
+    c["auth"] = vi.fn(async (action: string) => {
+      if (action === "push") {
+        order.push("push");
+        throw new ApiError(0, "offline");
+      }
+      throw new Error(`Unexpected action: ${action}`);
+    }) as (typeof c)["auth"];
+
+    await expect(c.flush(true)).rejects.toThrow("offline");
+    expect(order).toEqual(["pull", "push"]);
+    expect(s.queue).toHaveLength(1);
+  });
+});
