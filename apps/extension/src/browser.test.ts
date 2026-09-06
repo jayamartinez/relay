@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { capture, reconcile } from "./browser";
 import { BrowserEvents } from "./browser-events";
 import { browserWorkspace, type Mapping, observe } from "./browser-model";
+import { BrowserRuntimeRaceError } from "./browser-runtime";
 
 afterEach(() => vi.unstubAllGlobals());
 function fixture(existing: boolean) {
@@ -129,4 +130,66 @@ it("does not replay a stale deletion after a tab navigates during reconciliation
   chrome.tabs.get = get as typeof chrome.tabs.get;
   await reconcile({ ...f.target, tabs: {} }, f.mapping, "device", async () => {});
   expect(chrome.tabs.remove).not.toHaveBeenCalled();
+});
+
+it("does not recreate a tab when a user close supersedes a stale reconcile plan", async () => {
+  const f = fixture(false);
+  let closed = false;
+  await expect(
+    reconcile(
+      f.target,
+      f.mapping,
+      "device",
+      async () => {
+        // The initial reconciliation plan exists, then tabs.onRemoved records a
+        // fresh delete intent before Chrome is allowed to create the missing tab.
+        closed = true;
+      },
+      (tab) => !(closed && tab?.id === "tab"),
+    ),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+  expect(f.create).not.toHaveBeenCalled();
+});
+
+it("does not restore an older URL when a user navigation supersedes its reconcile plan", async () => {
+  const f = fixture(true);
+  let navigated = false;
+  await expect(
+    reconcile(
+      { ...f.target, tabs: { tab: { ...f.target.tabs.tab, url: "https://example.com/old" } } },
+      f.mapping,
+      "device",
+      async () => {
+        // This models tabs.onUpdated receiving the user's newer URL between plan
+        // construction and the awaited tabs.get/tabs.update boundary.
+        navigated = true;
+      },
+      (tab, mutation) => !(navigated && tab?.id === "tab" && mutation === "navigate"),
+    ),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+  expect(f.update).not.toHaveBeenCalled();
+});
+
+it("does not restore an old URL while a discarded tab is waking into a user navigation", async () => {
+  const f = fixture(true);
+  chrome.tabs.get = vi.fn(async () => ({
+    id: 7,
+    windowId: 1,
+    index: 0,
+    pinned: false,
+    incognito: false,
+    url: "https://example.com/old",
+    pendingUrl: "https://example.com/new-user-url",
+    discarded: true,
+  })) as unknown as typeof chrome.tabs.get;
+  await expect(
+    reconcile(
+      { ...f.target, tabs: { tab: { ...f.target.tabs.tab, url: "https://example.com/old" } } },
+      f.mapping,
+      "device",
+      async () => {},
+      (tab, mutation) => !(tab?.id === "tab" && mutation === "navigate"),
+    ),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+  expect(f.update).not.toHaveBeenCalled();
 });

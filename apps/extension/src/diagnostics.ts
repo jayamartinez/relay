@@ -11,6 +11,7 @@ export interface DiagnosticEntry {
   source: Source;
   event: string;
   action: Action;
+  detail?: string;
 }
 const counters: Record<string, number> = {};
 const entries: DiagnosticEntry[] = [];
@@ -29,6 +30,7 @@ export function trace(
   action: Action,
   resource = "",
   operation = "",
+  detail?: string,
 ) {
   if (!enabled()) return;
   const key = `${event}.${action}`;
@@ -41,6 +43,7 @@ export function trace(
     source,
     event,
     action,
+    detail,
   });
   if (entries.length > 200) entries.shift();
 }

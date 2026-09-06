@@ -68,7 +68,14 @@ import {
   workspaceStats,
 } from "./browser";
 import { BrowserEvents, type Lifecycle } from "./browser-events";
-import { browserWorkspace, diffWorkspace, type Mapping, navigationCircuit } from "./browser-model";
+import {
+  browserWorkspace,
+  diffWorkspace,
+  type Mapping,
+  navigationCircuit,
+  navigationKey,
+  recordLocalIntent,
+} from "./browser-model";
 import { asBrowserRuntimeRace } from "./browser-runtime";
 import { diagnosticDevice, diagnosticSnapshot, trace } from "./diagnostics";
 import { type FailureDisposition, failurePolicy } from "./failure-policy";
@@ -133,6 +140,7 @@ export class Controller {
   readonly events = new BrowserEvents();
   lifecycle: Lifecycle = "UNINITIALIZED";
   private remoteWindowCloses = new Map<number, number>();
+  private reconcileGeneration = 0;
   private local?: Local;
   private signing?: CryptoKey;
   private exchange?: CryptoKey;
@@ -458,6 +466,7 @@ export class Controller {
       this.events.navigation(local, url, complete);
       return;
     }
+    this.recordNavigationIntent(local, url);
     this.events.navigation(local, url, complete);
   }
   navigationCommitted(local: number, url: string, transition: string, qualifiers: string[]) {
@@ -492,7 +501,39 @@ export class Controller {
       const logical = this.restoreCandidate?.tabs[local];
       if (logical) this.startupDeletedTabs.add(logical);
     }
+    this.recordDeleteIntent(local);
     this.events.removed(local, window, false);
+  }
+  private recordNavigationIntent(local: number, url: string) {
+    const s = this.local;
+    const id = s?.mapping.tabs[local];
+    const previous = id ? s.mapping.observed.tabs[id] : undefined;
+    if (!s || !id || !previous || navigationKey(previous) === url) return;
+    const intent = recordLocalIntent(s.mapping, id, {
+      kind: "navigate",
+      url,
+      canonicalRevision: s.canonical.revision,
+    });
+    trace("USER", "TAB_NAVIGATE", "DETECTED", id, "", `intent:${intent.generation}`);
+    // Persist before the debounced capture/journal transaction so service-worker
+    // restart cannot resurrect an immediately closed or navigated tab from an old pull.
+    void this.persist().catch(() => {});
+  }
+  private recordDeleteIntent(local: number) {
+    const s = this.local;
+    const id = s?.mapping.tabs[local];
+    if (!s || !id) return;
+    const expected = s.mapping.expected.some(
+      (event) =>
+        event.resource === id && event.mutation === "tab-delete" && event.expires > Date.now(),
+    );
+    if (expected) return;
+    const intent = recordLocalIntent(s.mapping, id, {
+      kind: "delete",
+      canonicalRevision: s.canonical.revision,
+    });
+    trace("USER", "TAB_DELETE", "DETECTED", id, "", `intent:${intent.generation}`);
+    void this.persist().catch(() => {});
   }
   async groupUpdated(local: number, collapsed: boolean) {
     if (this.local && updateCollapsedGroup(this.local.mapping, local, collapsed))
@@ -1141,10 +1182,16 @@ export class Controller {
       Object.entries(s.mapping.tabs).map(([local, logical]) => [logical, Number(local)]),
     );
     for (const change of changes) {
+      const logical =
+        change.type === "tab-create" ? change.tab.id : "id" in change ? change.id : undefined;
+      if (logical) {
+        const intent = s.mapping.freshness?.intents[logical];
+        if (intent) intent.journaled = true;
+      }
       if (change.type === "tab-navigate" || change.type === "tab-create") {
-        const logical = change.type === "tab-create" ? change.tab.id : change.id;
-        const tab = s.mapping.observed.tabs[logical];
-        const local = localTabs.get(logical);
+        const tabId = change.type === "tab-create" ? change.tab.id : change.id;
+        const tab = s.mapping.observed.tabs[tabId];
+        const local = localTabs.get(tabId);
         if (tab && local !== undefined)
           expectNavigation(s.mapping, tab, local, undefined, operation.id, "USER");
       }
@@ -1225,6 +1272,8 @@ export class Controller {
     if (this.events.closing || this.lifecycle === "STOPPED") return;
     if (!s.intent && diffWorkspace(s.mapping.observed, target).length === 0) return;
     s.intent = target;
+    const planGeneration = ++this.reconcileGeneration;
+    const intentGeneration = s.mapping.freshness?.generation ?? 0;
     const occupied = new Set(Object.values(target.tabs).map((tab) => tab.window));
     for (const [local, expires] of this.remoteWindowCloses)
       if (expires <= Date.now()) this.remoteWindowCloses.delete(local);
@@ -1239,10 +1288,26 @@ export class Controller {
         s.mapping,
         s.device.id,
         async (mapping) => {
+          // Browser callbacks are not serialized with this reconciliation. Keep any
+          // newer direct user intent when reconcile persists an older mapping clone.
+          mapping.freshness = structuredClone(s.mapping.freshness);
           s.mapping = mapping;
           await this.persist();
         },
-        () => !this.events.closing,
+        (tab, mutation) => {
+          if (this.events.closing || planGeneration !== this.reconcileGeneration) return false;
+          const freshness = s.mapping.freshness;
+          if ((freshness?.generation ?? 0) !== intentGeneration) return false;
+          if (!tab) return true;
+          const intent = freshness?.intents[tab.id];
+          if (!intent) return true;
+          if (intent.kind === "delete") return false;
+          return mutation !== "navigate" || navigationKey(tab) === intent.url;
+        },
+        (tab) => {
+          const intent = tab ? s.mapping.freshness?.intents[tab.id] : undefined;
+          return `rev:${target.revision};plan:${planGeneration};intent:${intent?.generation ?? intentGeneration};delete:${intent?.kind === "delete"}`;
+        },
       );
     } catch (error) {
       if (this.events.closing) return; // Keep durable intent; the close transaction decides next.
@@ -1354,6 +1419,7 @@ export class Controller {
     );
     s.canonical = canonicalState;
     s.queue = s.queue.filter((q) => q.sequence > reply.sequence);
+    this.settleLocalIntents();
     this.pruneLocalGroupState();
     s.nextSequence = Math.max(s.nextSequence, reply.sequence + 1);
     assert(Array.isArray(reply.pending) && reply.pending.length <= LIMITS.pending);
@@ -1398,6 +1464,26 @@ export class Controller {
     )
       await this.applyBrowser(this.projected());
     this.error = "";
+  }
+  private settleLocalIntents() {
+    const s = this.require();
+    const intents = s.mapping.freshness?.intents;
+    if (!intents) return;
+    const pending = new Set(
+      s.queue.flatMap((entry) =>
+        entry.operation.changes.flatMap((change) =>
+          change.type === "tab-create" ? [change.tab.id] : "id" in change ? [change.id] : [],
+        ),
+      ),
+    );
+    for (const [id, intent] of Object.entries(intents)) {
+      if (!intent.journaled) continue;
+      if (pending.has(id)) continue;
+      const canonical = s.canonical.tabs[id];
+      // A signed pull acknowledging our sequence makes the canonical outcome
+      // deterministic. It may be our local value or a later concurrent winner.
+      if (intent.kind === "delete" ? !canonical : true) delete intents[id];
+    }
   }
   async flush() {
     const s = this.local;
