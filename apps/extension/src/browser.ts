@@ -15,6 +15,7 @@ import {
   suppress,
   targetUrl,
 } from "./browser-model";
+import { BrowserRuntimeRaceError } from "./browser-runtime";
 import { trace } from "./diagnostics";
 import { groupsAvailable, reconcileGroups, requireGroupSupport } from "./group-browser";
 import {
@@ -183,8 +184,7 @@ export async function reconcile(
   // Intent is durable before calling Chrome. A terminated worker can replay this target.
   await persist(next);
   const actual = await browserWindows();
-  if (!actual.length || !allowed())
-    throw new Error("Browser reconciliation interrupted by window closure.");
+  if (!actual.length || !allowed()) throw new BrowserRuntimeRaceError();
   next.collapsed ??= {};
   for (const window of actual)
     for (const group of window.groups ?? []) {
@@ -200,7 +200,7 @@ export async function reconcile(
     Object.entries(next.tabs).map(([local, sync]) => [sync, Number(local)]),
   );
   for (const window of Object.values(target.windows).sort((a, b) => a.order - b.order)) {
-    if (!allowed()) throw new Error("Browser reconciliation interrupted by window closure.");
+    if (!allowed()) throw new BrowserRuntimeRaceError();
     const desired = tabsIn(target, window.id);
     if (!desired.length) continue;
     let local = localWindows.get(window.id);
@@ -230,7 +230,7 @@ export async function reconcile(
       await persist(next);
     }
     for (const tab of desired) {
-      if (!allowed()) throw new Error("Browser reconciliation interrupted by window closure.");
+      if (!allowed()) throw new BrowserRuntimeRaceError();
       let localTab = localTabs.get(tab.id);
       let live =
         localTab === undefined ? undefined : await chrome.tabs.get(localTab).catch(() => undefined);

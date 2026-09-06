@@ -2,6 +2,7 @@
 import { tabsIn, type Workspace } from "@relay/protocol";
 import { assert, syncableTab } from "@relay/shared";
 import { type Mapping, observedTab, physicalIndex } from "./browser-model";
+import { BrowserRuntimeRaceError } from "./browser-runtime";
 
 declare const __DISABLE_TAB_GROUPS_FOR_DEVELOPMENT__: boolean;
 export interface BrowserCapabilities {
@@ -69,16 +70,11 @@ export async function reconcileGroups(
     const tabIds = group.tabs
       .map((id) => localTabs.get(id))
       .filter((id): id is number => id !== undefined);
-    assert(
-      windowId !== undefined && tabIds.length === group.tabs.length,
-      "Group members are not available yet.",
-    );
+    if (windowId === undefined || tabIds.length !== group.tabs.length)
+      throw new BrowserRuntimeRaceError("Group members are not available yet.");
     live = await chrome.tabs.query({ windowId });
     const valid = tabIds.every((id) => live.some((t) => t.id === id && !t.incognito && !t.pinned));
-    assert(
-      valid,
-      "Group members changed during reconciliation. Retry when tab dragging has finished.",
-    );
+    if (!valid) throw new BrowserRuntimeRaceError("Group members changed during reconciliation.");
     const groupId = Object.entries(oldMapping).find(
       ([local, sync]) => sync === group.id && nativeGroups.has(Number(local)),
     )?.[0];

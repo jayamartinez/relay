@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { APPROVAL_EXPIRY_ALARM, Controller } from "./controller";
 import { groupsAvailable } from "./group-browser";
+import { SerialTaskQueue } from "./serial-task-queue";
 
 const controller = new Controller();
 const statusPorts = new Set<chrome.runtime.Port>();
@@ -17,14 +18,15 @@ chrome.runtime.onConnect.addListener((port) => {
   statusPorts.add(port);
   port.onDisconnect.addListener(() => statusPorts.delete(port));
 });
-let serial: Promise<unknown> = Promise.resolve();
+const serial = new SerialTaskQueue();
 function run<T>(task: () => Promise<T>): Promise<T> {
-  const next = serial.then(async () => {
-    await controller.load();
-    return task();
-  });
-  serial = next.catch((error) => controller.failure(error));
-  return next;
+  return serial.run(
+    async () => {
+      await controller.load();
+      return task();
+    },
+    (error) => controller.failure(error),
+  );
 }
 controller.wake = () => {
   void run(() => controller.reconnect())

@@ -683,9 +683,13 @@ function settings() {
         ),
       );
     if (state.startTrace?.length) development.append(el("pre", "", state.startTrace.join("\n")));
-    if (state.behavior)
+    if (state.runtime || state.behavior)
       development.append(
-        el("pre", "", JSON.stringify({ lifecycle: state.lifecycle, ...state.behavior }, null, 2)),
+        el(
+          "pre",
+          "",
+          JSON.stringify({ runtime: state.runtime, behavior: state.behavior }, null, 2),
+        ),
       );
     content.append(development);
   }

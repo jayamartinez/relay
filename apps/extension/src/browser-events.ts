@@ -2,12 +2,13 @@
 export type Lifecycle =
   | "UNINITIALIZED"
   | "LOADING_LOCAL_STATE"
+  | "WAITING_FOR_BROWSER_RESTORE"
   | "FETCHING_CANONICAL_STATE"
   | "RECONCILING"
   | "LIVE"
   | "STOPPED";
 export const NAVIGATION_DELAY = 200;
-export const WINDOW_CLOSE_DELAY = 600;
+export const WINDOW_CLOSE_DELAY = 1_200;
 export interface BrowserBatch {
   closedTabs: Set<number>;
   closingWindows: Set<number>;
@@ -77,6 +78,20 @@ export class BrowserEvents {
   }
   get closing() {
     return this.pending.closingWindows.size > 0;
+  }
+  summary() {
+    return {
+      generation: this.generation,
+      closedTabs: this.pending.closedTabs.size,
+      closingWindows: this.pending.closingWindows.size,
+      createdWindows: this.pending.createdWindows.size,
+      navigations: this.pending.navigations.size,
+      pending:
+        this.pending.closedTabs.size +
+        this.pending.closingWindows.size +
+        this.pending.createdWindows.size +
+        this.pending.navigations.size,
+    };
   }
   take(now = Date.now()): BrowserBatch | undefined {
     if (now < this.readyAt) return;

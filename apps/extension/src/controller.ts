@@ -69,7 +69,9 @@ import {
 } from "./browser";
 import { BrowserEvents, type Lifecycle } from "./browser-events";
 import { diffWorkspace, type Mapping, navigationCircuit } from "./browser-model";
+import { asBrowserRuntimeRace } from "./browser-runtime";
 import { diagnosticDevice, diagnosticSnapshot, trace } from "./diagnostics";
+import { type FailureDisposition, failurePolicy } from "./failure-policy";
 import { groupsAvailable, groupsEnabled, requireGroupSupport } from "./group-browser";
 import { pruneCollapsedGroups, updateCollapsedGroup } from "./group-model";
 import { committedNavigation, expectNavigation, remoteNavigationEvent } from "./navigation";
@@ -79,6 +81,9 @@ import {
   type SyncPreferencesV1,
   saveSyncPreferences,
 } from "./preferences";
+import { RemoteChangeTracker } from "./remote-change-tracker";
+import { settleBrowserRestore } from "./restore-settling";
+import { socketNeedsReconnect } from "./socket-lifecycle";
 import * as vault from "./vault";
 import { initialMerge, restoreMapping } from "./workspace-lifecycle";
 
@@ -136,10 +141,18 @@ export class Controller {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectAttempt = 0;
   private lastSocketMessage = 0;
+  private socketStartedAt = 0;
+  private remoteChanges = new RemoteChangeTracker();
+  private restoreCandidate?: Mapping;
+  private startupDeletedTabs = new Set<string>();
+  private startupDeletedWindows = new Set<string>();
+  private startupNavigations = new Set<string>();
   private startTrace: string[] = [];
   private network = "Not connected";
   private error = "";
   private halted = false;
+  private lastErrorCategory = "NONE";
+  private lastErrorDisposition: "none" | FailureDisposition = "none";
   private loaded = false;
   private loadFailed = false;
   private lastCheckpoint = 0;
@@ -273,13 +286,22 @@ export class Controller {
       this.failure(error);
     }
   }
-  private async quiet() {
-    // A one-shot event quiet barrier, not periodic workspace scanning.
-    let delay = Math.max(200, this.events.quietAt - Date.now());
-    while (delay > 0) {
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = this.events.quietAt - Date.now();
-    }
+  private clearStartupTracking() {
+    this.restoreCandidate = undefined;
+    this.startupDeletedTabs.clear();
+    this.startupDeletedWindows.clear();
+    this.startupNavigations.clear();
+  }
+  private startupChanges(target: Workspace, mapping: Mapping, created: Change[]): Change[] {
+    return [
+      ...created,
+      ...diffWorkspace(target, mapping.observed).filter((change) => {
+        if (change.type === "tab-delete") return this.startupDeletedTabs.has(change.id);
+        if (change.type === "window-delete") return this.startupDeletedWindows.has(change.id);
+        if (change.type === "tab-navigate") return this.startupNavigations.has(change.id);
+        return false;
+      }),
+    ];
   }
   private async stopped() {
     this.lifecycle = "STOPPED";
@@ -292,14 +314,80 @@ export class Controller {
   }
   private async hydrate() {
     const s = this.require();
-    this.lifecycle = "FETCHING_CANONICAL_STATE";
-    if (!(await browserWindows()).length) {
-      await this.stopped();
-      return;
+    const resumingFromStopped = this.lifecycle === "STOPPED";
+    const session = await sessionId();
+    let actual;
+    this.clearStartupTracking();
+    if (s.mapping.session !== session) {
+      this.lifecycle = "WAITING_FOR_BROWSER_RESTORE";
+      const settled = await settleBrowserRestore({
+        read: browserWindows,
+        previous: s.mapping,
+        target: this.projected(),
+        session,
+        source: s.device.id,
+        origin: ownOrigin(),
+        quietAt: () => this.events.quietAt,
+        sampled: (sample) => {
+          this.restoreCandidate = sample.mapping;
+        },
+      });
+      actual = settled.actual;
+      if (!actual.length) {
+        this.clearStartupTracking();
+        await this.stopped();
+        return;
+      }
+      const localTarget = this.projected();
+      const adopted = restoreMapping(
+        actual,
+        this.restoreCandidate ?? s.mapping,
+        localTarget,
+        session,
+        s.device.id,
+        ownOrigin(),
+      );
+      s.mapping = adopted.mapping;
+      await this.enqueue(
+        this.startupChanges(localTarget, adopted.mapping, adopted.changes),
+        "STARTUP",
+      );
+      await this.persist();
+      // Native restoration and explicitly attributed startup actions are now adopted.
+      // Events arriving after this point belong to ordinary browser use during the pull.
+      this.events.clear();
+      this.clearStartupTracking();
+    } else {
+      actual = await browserWindows();
+      if (!actual.length) {
+        await this.stopped();
+        return;
+      }
+      if (resumingFromStopped) {
+        const adopted = restoreMapping(
+          actual,
+          s.mapping,
+          this.projected(),
+          session,
+          s.device.id,
+          ownOrigin(),
+        );
+        s.mapping = adopted.mapping;
+        await this.enqueue(adopted.changes, "STARTUP");
+        await this.persist();
+        // Chrome's starter window replaces the closed last window in this browser lifetime.
+        this.events.clear();
+      }
     }
+    this.lifecycle = "FETCHING_CANONICAL_STATE";
     if (!s.paused) await this.pull();
-    await this.quiet();
-    const actual = await browserWindows();
+    while (this.events.readyAt > Date.now())
+      await new Promise((resolve) => setTimeout(resolve, this.events.readyAt - Date.now()));
+    this.lifecycle = "LIVE";
+    await this.captureLocal();
+    if ((this.lifecycle as Lifecycle) === "STOPPED") return;
+    this.lifecycle = "FETCHING_CANONICAL_STATE";
+    actual = await browserWindows();
     if (!actual.length) {
       await this.stopped();
       return;
@@ -307,9 +395,9 @@ export class Controller {
     this.lifecycle = "RECONCILING";
     const restored = restoreMapping(
       actual,
-      s.mapping,
+      this.restoreCandidate ?? s.mapping,
       this.projected(),
-      await sessionId(),
+      session,
       s.device.id,
       ownOrigin(),
     );
@@ -324,6 +412,7 @@ export class Controller {
     this.events.clear(); // Reconciliation observed the final browser state, including startup events.
     this.lifecycle = "LIVE";
     await this.persist();
+    if (this.remoteChanges.dirty) await this.flush();
   }
   navigationEvent(local: number, url: string, complete: boolean) {
     if (this.local && remoteNavigationEvent(this.local.mapping, local, url, complete)) {
@@ -334,6 +423,14 @@ export class Controller {
     this.events.navigation(local, url, complete);
   }
   navigationCommitted(local: number, url: string, transition: string, qualifiers: string[]) {
+    if (
+      this.lifecycle === "WAITING_FOR_BROWSER_RESTORE" &&
+      transition !== "reload" &&
+      !qualifiers.includes("forward_back")
+    ) {
+      const logical = this.restoreCandidate?.tabs[local];
+      if (logical) this.startupNavigations.add(logical);
+    }
     if (this.local) committedNavigation(this.local.mapping, local, url, transition, qualifiers);
     this.events.committed(local, url, transition, qualifiers);
   }
@@ -342,12 +439,20 @@ export class Controller {
       trace("REMOTE", "WINDOW_DELETE", "SUPPRESS");
       return;
     }
+    if (this.lifecycle === "WAITING_FOR_BROWSER_RESTORE") {
+      const logical = this.restoreCandidate?.windows[local];
+      if (logical) this.startupDeletedWindows.add(logical);
+    }
     this.events.windowRemoved(local);
   }
   tabRemoved(local: number, window: number, isWindowClosing: boolean) {
     if (isWindowClosing) {
       this.windowRemoved(window);
       return;
+    }
+    if (this.lifecycle === "WAITING_FOR_BROWSER_RESTORE") {
+      const logical = this.restoreCandidate?.tabs[local];
+      if (logical) this.startupDeletedTabs.add(logical);
     }
     this.events.removed(local, window, false);
   }
@@ -356,18 +461,23 @@ export class Controller {
       await this.persist();
   }
   failure(error: unknown) {
-    this.error = error instanceof Error ? error.message : "Relay could not complete this action.";
-    if (
-      error instanceof ApiError &&
-      (error.status === 0 || error.status === 429 || error.status >= 500)
-    ) {
+    const browserRace = asBrowserRuntimeRace(error);
+    const policy = failurePolicy(error);
+    this.error = browserRace
+      ? "The browser changed while Relay was reconciling. Relay will retry automatically."
+      : error instanceof Error
+        ? error.message
+        : "Relay could not complete this action.";
+    this.lastErrorCategory = policy.category;
+    this.lastErrorDisposition = policy.disposition;
+    if (policy.category === "NETWORK") {
       this.network = "Offline";
       this.disconnect();
       this.scheduleReconnect();
-    } else if (
-      error instanceof ApiError &&
-      (error.status === 409 || error.status === 410 || error.status === 404)
-    ) {
+    } else if (policy.browserRace) {
+      if (this.socket?.readyState !== WebSocket.OPEN) this.network = "Recovering";
+      this.scheduleReconnect();
+    } else if (policy.disposition === "action-required") {
       // Conflicts/enrollment expiry are actionable, not evidence of corrupt ciphertext.
     } else {
       this.halted = true;
@@ -1083,7 +1193,7 @@ export class Controller {
       );
     } catch (error) {
       if (this.events.closing) return; // Keep durable intent; the close transaction decides next.
-      throw error;
+      throw asBrowserRuntimeRace(error) ?? error;
     } finally {
       this.lifecycle = previousLifecycle;
     }
@@ -1124,6 +1234,7 @@ export class Controller {
   }
   async pull(force = false) {
     const s = this.require();
+    const requestedRemoteGeneration = this.remoteChanges.snapshot();
     assert(s.control);
     const reply = await this.auth<SyncReply>("sync", {
       since: s.canonical.revision,
@@ -1216,6 +1327,7 @@ export class Controller {
     }
     s.presence = reply.presence;
     s.lastSynced = Date.now();
+    this.remoteChanges.acknowledge(requestedRemoteGeneration);
     this.lastApprovalRefresh = Date.now();
     await this.updateApprovalBadge();
     await this.persist();
@@ -1352,6 +1464,7 @@ export class Controller {
     clearInterval(this.heartbeat);
     clearTimeout(this.reconnectTimer);
     this.heartbeat = undefined;
+    this.socketStartedAt = 0;
     const old = this.socket;
     this.socket = undefined;
     if (old) {
@@ -1368,6 +1481,7 @@ export class Controller {
       this.lifecycle === "STOPPED"
     )
       return;
+    clearTimeout(this.reconnectTimer);
     const delay =
       Math.min(300_000, 2000 * 2 ** Math.min(this.reconnectAttempt++, 8)) *
       (0.75 + Math.random() * 0.5);
@@ -1388,13 +1502,26 @@ export class Controller {
     const url = new URL(`${s.server}/v1/${s.handle}/socket`);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.searchParams.set("ticket", ticket);
-    const socket = new WebSocket(url);
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(url);
+    } catch (cause) {
+      throw new ApiError(
+        0,
+        "Relay live connection could not start. Your local changes are saved.",
+        "SOCKET_OPEN_FAILED",
+        "SOCKET",
+        cause,
+      );
+    }
     this.socket = socket;
+    this.socketStartedAt = Date.now();
     s.diagnostics.reconnects++;
     await this.persist();
     socket.onopen = () => {
       this.network = "Live";
       this.reconnectAttempt = 0;
+      this.socketStartedAt = 0;
       this.lastSocketMessage = Date.now();
       void chrome.alarms.create("relay-reconnect", { periodInMinutes: 1 });
       this.heartbeat = setInterval(() => {
@@ -1410,6 +1537,7 @@ export class Controller {
     };
     socket.onmessage = (event) => {
       this.lastSocketMessage = Date.now();
+      if (event.data === "changed") this.remoteChanges.note();
       if (event.data !== "pong") this.onSocketMessage(String(event.data));
     };
     socket.onclose = () => {
@@ -1424,6 +1552,7 @@ export class Controller {
   }
   async socketMessage(data: string) {
     if (data === "changed") {
+      if (this.lifecycle !== "LIVE") return;
       await this.captureLocal();
       await this.flush();
       return;
@@ -1450,10 +1579,13 @@ export class Controller {
   }
   async watchdog() {
     if (
-      this.socket?.readyState === WebSocket.OPEN ||
-      this.socket?.readyState === WebSocket.CONNECTING
+      !socketNeedsReconnect(this.socket?.readyState, this.socketStartedAt, this.lastSocketMessage)
     )
       return;
+    if (this.socket) {
+      this.disconnect();
+      this.network = "Offline";
+    }
     await this.connect();
   }
   async cancelSetup() {
@@ -1467,6 +1599,7 @@ export class Controller {
     const s = this.local;
     await this.pruneExpiredApprovals();
     const stats = await workspaceStats();
+    const projected = s ? this.projected() : undefined;
     let sas: string | undefined;
     const approvals = [];
     if (
@@ -1541,11 +1674,37 @@ export class Controller {
       devices:
         s?.control?.members.map((d) => ({
           id: d.id,
-          name: this.projected().names[d.id] ?? "Relay device",
+          name: projected?.names[d.id] ?? "Relay device",
           ...s.presence[d.id],
         })) ?? [],
       diagnostics: __DEV__ ? s?.diagnostics : undefined,
       lifecycle: this.lifecycle,
+      runtime: __DEV__
+        ? {
+            lifecycle: this.lifecycle,
+            halted: this.halted,
+            paused: s?.paused ?? false,
+            socketReadyState: this.socket?.readyState ?? WebSocket.CLOSED,
+            reconnectAttempt: this.reconnectAttempt,
+            lastSocketMessageAge:
+              this.lastSocketMessage > 0 ? Date.now() - this.lastSocketMessage : undefined,
+            events: this.events.summary(),
+            queue: s?.queue.length ?? 0,
+            canonicalRevision: s?.canonical.revision,
+            projected: projected
+              ? {
+                  revision: projected.revision,
+                  windows: Object.keys(projected.windows).length,
+                  tabs: Object.keys(projected.tabs).length,
+                  groups: Object.keys(projected.groups).length,
+                }
+              : undefined,
+            intent: !!s?.intent,
+            remoteDirty: this.remoteChanges.dirty,
+            lastErrorCategory: this.lastErrorCategory,
+            lastErrorDisposition: this.lastErrorDisposition,
+          }
+        : undefined,
       behavior: diagnosticSnapshot(),
       startTrace: __DEV__ ? [...this.startTrace] : undefined,
     };
