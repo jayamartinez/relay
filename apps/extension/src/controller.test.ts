@@ -1,5 +1,7 @@
-import { emptyWorkspace } from "@relay/protocol";
+import { base64, encryptEnvelope } from "@relay/crypto";
+import { emptyWorkspace, type Operation, type SyncReply } from "@relay/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fixture } from "../../../tests/fixtures";
 import { ApiError } from "./api";
 import { browserWindows, capture, reconcile, sessionId } from "./browser";
 import { BrowserRuntimeRaceError } from "./browser-runtime";
@@ -203,6 +205,130 @@ describe("controller transport recovery", () => {
     }
     expect(c.flush).not.toHaveBeenCalled();
     expect(c["halted"]).toBe(false);
+  });
+});
+
+describe("controller bounded sync pull", () => {
+  it("applies contiguous encrypted pages before acknowledging queued local work", async () => {
+    const f = await fixture();
+    const c = setup();
+    vi.mocked(c.pull).mockRestore();
+    const queued: Operation = {
+      id: "queued",
+      sender: f.device.device.id,
+      sequence: 3,
+      base: 0,
+      changes: [{ type: "window-create", id: "queued-window", order: 0 }],
+    };
+    Object.assign(c["local"]!, {
+      handle: f.handle,
+      device: f.device.device,
+      root: base64(f.root),
+      control: f.control,
+      canonical: f.workspace,
+      queue: [{ sequence: 3, operation: queued }],
+      nextSequence: 4,
+    });
+    c["signing"] = f.device.signing;
+    const first: Operation = {
+      id: "first",
+      sender: f.device.device.id,
+      sequence: 1,
+      base: 0,
+      changes: [{ type: "window-create", id: "remote-window", order: 0 }],
+    };
+    const second: Operation = {
+      id: "second",
+      sender: f.device.device.id,
+      sequence: 2,
+      base: 1,
+      changes: [{ type: "window-delete", id: "remote-window" }],
+    };
+    const envelope = (operation: Operation) =>
+      encryptEnvelope(
+        f.root,
+        f.device.signing,
+        {
+          version: 1,
+          account: f.handle,
+          epoch: 1,
+          sender: f.device.device.id,
+          sequence: operation.sequence,
+          base: operation.base,
+          type: "operation",
+        },
+        operation,
+      );
+    const firstEnvelope = await envelope(first);
+    const secondEnvelope = await envelope(second);
+    const pages: SyncReply[] = [
+      {
+        control: f.control,
+        chain: [],
+        operations: [{ revision: 1, envelope: firstEnvelope }],
+        from: 0,
+        next: 1,
+        more: true,
+        revision: 2,
+        sequence: 2,
+        pending: [],
+        presence: {},
+      },
+      {
+        control: f.control,
+        chain: [],
+        operations: [{ revision: 2, envelope: secondEnvelope }],
+        from: 1,
+        next: 2,
+        more: false,
+        revision: 2,
+        sequence: 2,
+        pending: [],
+        presence: {},
+      },
+    ];
+    c["auth"] = vi.fn(async (action: string, payload: { since: number; pagination: boolean }) => {
+      expect(action).toBe("sync");
+      expect(payload.pagination).toBe(true);
+      if (payload.since === 0) return pages[0]!;
+      expect(c["local"]!.canonical.revision).toBe(1);
+      expect(c["local"]!.queue).toHaveLength(1);
+      return pages[1]!;
+    }) as (typeof c)["auth"];
+
+    await c.pull();
+
+    expect(c["local"]!.canonical.revision).toBe(2);
+    expect(c["local"]!.canonical.windows).toEqual({});
+    expect(c["local"]!.queue).toEqual([{ sequence: 3, operation: queued }]);
+    expect(c["auth"]).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails safely when a claimed continuation does not advance", async () => {
+    const f = await fixture();
+    const c = setup();
+    vi.mocked(c.pull).mockRestore();
+    Object.assign(c["local"]!, {
+      handle: f.handle,
+      device: f.device.device,
+      root: base64(f.root),
+      control: f.control,
+      canonical: f.workspace,
+    });
+    c["signing"] = f.device.signing;
+    c["auth"] = vi.fn(async () => ({
+      control: f.control,
+      chain: [],
+      operations: [],
+      from: 0,
+      next: 0,
+      more: true,
+      revision: 1,
+      sequence: 0,
+      pending: [],
+      presence: {},
+    })) as (typeof c)["auth"];
+    await expect(c.pull()).rejects.toThrow("Sync continuation made no progress.");
   });
 });
 

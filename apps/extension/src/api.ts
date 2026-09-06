@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { hash, sign } from "@relay/crypto";
 import { CHALLENGE_LIFETIME_MS, type Challenge, CLOCK_SKEW_MS } from "@relay/protocol";
-import { assert, canonical, id, integer, LIMITS, record, serverOrigin, text } from "@relay/shared";
+import {
+  assert,
+  canonical,
+  id,
+  integer,
+  record,
+  SYNC_CLIENT_RESPONSE_BYTE_LIMIT,
+  serverOrigin,
+  text,
+} from "@relay/shared";
 
 declare const __DEV__: boolean;
 
@@ -232,7 +241,7 @@ export class Api {
         }
         if (chunk.done) break;
         size += chunk.value.byteLength;
-        if (size > LIMITS.message * 4) {
+        if (size > SYNC_CLIENT_RESPONSE_BYTE_LIMIT) {
           await reader.cancel();
           throw new Error("Server response is too large.");
         }

@@ -17,7 +17,16 @@ import {
   type Reveal,
   sameDevice,
 } from "@relay/protocol";
-import { assert, canonical, id, integer, LIMITS, record, text } from "@relay/shared";
+import {
+  assert,
+  canonical,
+  id,
+  integer,
+  LIMITS,
+  record,
+  SYNC_RESPONSE_BYTE_BUDGET,
+  text,
+} from "@relay/shared";
 
 interface Env {
   ACCOUNTS: DurableObjectNamespace<RelayAccount>;
@@ -46,6 +55,7 @@ const json = (value: unknown, status = 200) =>
     status,
     headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
   });
+const jsonBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -409,32 +419,73 @@ export class RelayAccount extends DurableObject<Env> {
       const since = integer(p.since);
       const generation = Number(p.generation);
       assert(Number.isInteger(generation) && generation >= -1);
+      if (since > meta.revision) fail(409, "Sync continuation is ahead of the server.");
       const snapshot =
         since < meta.snapshot.header.base || p.force === true ? meta.snapshot : undefined;
       const from = snapshot ? snapshot.header.base : since;
-      const operations = this.ctx.storage.sql
-        .exec<{ revision: number; envelope: string }>(
-          "SELECT revision,envelope FROM operations WHERE revision > ? ORDER BY revision",
-          from,
-        )
-        .toArray()
-        .map((row) => ({ revision: row.revision, envelope: JSON.parse(row.envelope) }));
       const presence: Record<string, { online: boolean; lastSeen: number }> = {};
       for (const device of meta.control.members)
         presence[device.id] = {
           online: this.ctx.getWebSockets(device.id).length > 0,
           lastSeen: this.get<number>(`seen:${device.id}`) ?? 0,
         };
-      return json({
+      const reply = {
         control: meta.control,
         chain: this.chain(generation),
         snapshot,
-        operations,
         revision: meta.revision,
         sequence: this.get<number>(`seq:${actor}`) ?? 0,
         pending: this.pending().filter((r) => r.status === "pending"),
         presence,
+        from,
+      };
+      // Use maximum-width continuation values while accounting. This is a
+      // conservative, UTF-8-exact budget for the final JSON without repeatedly
+      // serializing a growing response body.
+      const emptyPageBytes = jsonBytes({
+        ...reply,
+        operations: [],
+        next: Number.MAX_SAFE_INTEGER,
+        more: false,
       });
+      if (emptyPageBytes > SYNC_RESPONSE_BYTE_BUDGET)
+        fail(413, "Sync metadata exceeds the response budget.", "SYNC_RESPONSE_TOO_LARGE");
+      const operations: OperationRow[] = [];
+      let operationBytes = 0;
+      for (const row of this.ctx.storage.sql.exec<{ revision: number; envelope: string }>(
+        "SELECT revision,envelope FROM operations WHERE revision > ? ORDER BY revision",
+        from,
+      )) {
+        const operation = { revision: row.revision, envelope: JSON.parse(row.envelope) };
+        const serializedBytes = jsonBytes(operation);
+        const delimiterBytes = operations.length ? 1 : 0;
+        if (
+          emptyPageBytes + operationBytes + delimiterBytes + serializedBytes >
+          SYNC_RESPONSE_BYTE_BUDGET
+        ) {
+          if (!operations.length)
+            fail(
+              413,
+              "One operation exceeds the sync response budget.",
+              "SYNC_OPERATION_TOO_LARGE",
+            );
+          break;
+        }
+        operationBytes += delimiterBytes + serializedBytes;
+        operations.push(operation);
+      }
+      const next = operations.at(-1)?.revision ?? from;
+      const more = next < meta.revision;
+      // Older v1 clients do not understand a partial reply and would reject it
+      // after receiving it. Refuse safely instead of sending an oversized body.
+      if (more && p.pagination !== true)
+        fail(409, "Update Relay to continue this bounded sync.", "SYNC_PAGINATION_REQUIRED");
+      const page = { ...reply, operations, next, more };
+      // The conservative estimate above should make this unreachable; retain an
+      // exact final assertion against future response-shape changes.
+      if (jsonBytes(page) > SYNC_RESPONSE_BYTE_BUDGET)
+        fail(413, "Sync response exceeds the response budget.", "SYNC_RESPONSE_TOO_LARGE");
+      return json(page);
     }
     if (action === "socket-ticket") {
       const ticket = crypto.randomUUID();

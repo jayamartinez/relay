@@ -54,6 +54,7 @@ import {
   canonicalAccount,
   LIMITS,
   record,
+  SYNC_MAX_PAGES_PER_PULL,
   serverOrigin,
   text,
 } from "@relay/shared";
@@ -1354,27 +1355,64 @@ export class Controller {
     const s = this.require();
     const requestedRemoteGeneration = this.remoteChanges.snapshot();
     assert(s.control);
-    const reply = await this.auth<SyncReply>("sync", {
-      since: s.canonical.revision,
-      generation: s.control.generation,
-      force: force || s.phase === "merge",
-    });
+    let forceSnapshot = force || s.phase === "merge";
+    for (let page = 0; page < SYNC_MAX_PAGES_PER_PULL; page++) {
+      const before = s.canonical.revision;
+      const reply = await this.auth<SyncReply>("sync", {
+        since: before,
+        generation: s.control.generation,
+        force: forceSnapshot,
+        pagination: true,
+      });
+      forceSnapshot = false;
+      const result = await this.applySyncPage(reply, before, requestedRemoteGeneration);
+      if (result === "complete") return;
+      // A changed epoch at an already-current revision requires an authenticated
+      // snapshot under the new key before any later page can be applied.
+      if (result === "snapshot") {
+        forceSnapshot = true;
+        continue;
+      }
+      assert(s.canonical.revision > before, "Sync continuation made no progress.");
+    }
+    throw new Error("Sync catch-up exceeded the safe page limit. Relay will retry.");
+  }
+  private async applySyncPage(
+    reply: SyncReply,
+    requestedSince: number,
+    requestedRemoteGeneration: number,
+  ): Promise<"complete" | "more" | "snapshot"> {
+    const s = this.require();
     assert(
       Array.isArray(reply.chain) &&
         reply.chain.length <= LIMITS.control &&
         Array.isArray(reply.operations) &&
         reply.operations.length <= LIMITS.operations,
     );
-    const oldEpoch = s.control.epoch;
+    const previousControl = s.control;
+    assert(previousControl);
+    const oldEpoch = previousControl.epoch;
     await this.advanceChain(reply.chain);
     assert(
       s.control && canonical(parseControl(reply.control)) === canonical(s.control),
       "Membership state mismatch.",
     );
     if (oldEpoch !== s.control.epoch && !reply.snapshot) {
-      await this.pull(true);
-      return;
+      // Do not apply a page encrypted under an epoch whose authenticated
+      // snapshot was not supplied. The caller immediately retries with force.
+      return "snapshot";
     }
+    assert(
+      Number.isSafeInteger(reply.from) &&
+        Number.isSafeInteger(reply.next) &&
+        Number.isSafeInteger(reply.revision) &&
+        typeof reply.more === "boolean",
+      "Server does not support bounded sync responses.",
+    );
+    assert(
+      reply.from === requestedSince || reply.snapshot !== undefined,
+      "Invalid sync continuation start.",
+    );
     let canonicalState = s.canonical;
     const decrypt = async (envelope: Envelope) => {
       const member = s.control?.members.find((d) => d.id === envelope.header.sender);
@@ -1396,6 +1434,12 @@ export class Controller {
       canonicalState = parseWorkspace(await decrypt(snapshot));
       assert(canonicalState.revision === snapshot.header.base);
     }
+    assert(
+      reply.from === canonicalState.revision &&
+        reply.next >= reply.from &&
+        reply.next <= reply.revision,
+      "Invalid sync continuation range.",
+    );
     for (const row of reply.operations) {
       assert(row.revision === canonicalState.revision + 1, "Missing workspace revision.");
       const envelope = parseEnvelope(row.envelope);
@@ -1412,12 +1456,23 @@ export class Controller {
       );
       canonicalState = applyOperation(canonicalState, operation, row.revision);
     }
+    assert(canonicalState.revision === reply.next, "Workspace page revision mismatch.");
+    assert(reply.more === reply.next < reply.revision, "Invalid sync continuation state.");
+    assert(
+      reply.sequence >= (canonicalState.sequences[s.device.id] ?? 0),
+      "Unverified journal acknowledgment rejected.",
+    );
+    s.canonical = canonicalState;
+    // Persist each contiguous page. If the extension worker terminates, the
+    // next signed request resumes from this canonical revision without losing
+    // locally queued operations or acknowledging them prematurely.
+    await this.persist();
+    if (reply.more) return "more";
     assert(canonicalState.revision === reply.revision, "Workspace revision mismatch.");
     assert(
       reply.sequence === (canonicalState.sequences[s.device.id] ?? 0),
       "Unverified journal acknowledgment rejected.",
     );
-    s.canonical = canonicalState;
     s.queue = s.queue.filter((q) => q.sequence > reply.sequence);
     this.settleLocalIntents();
     this.pruneLocalGroupState();
@@ -1464,6 +1519,7 @@ export class Controller {
     )
       await this.applyBrowser(this.projected());
     this.error = "";
+    return "complete";
   }
   private settleLocalIntents() {
     const s = this.require();

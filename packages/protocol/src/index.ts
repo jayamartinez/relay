@@ -198,6 +198,12 @@ export interface SyncReply {
   chain: Control[];
   snapshot?: Envelope;
   operations: OperationRow[];
+  // `from` is the revision represented by the snapshot (if supplied), or the
+  // requested revision. Operations then cover the contiguous range through
+  // `next`. `revision` remains the server's latest revision for this reply.
+  from: number;
+  next: number;
+  more: boolean;
   revision: number;
   sequence: number;
   pending: PairRequest[];
