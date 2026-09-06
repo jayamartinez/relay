@@ -112,6 +112,10 @@ interface EphemeralState {
   commitment: string;
   request?: PairStart;
 }
+interface SnapshotRequirement {
+  epoch: number;
+  generation: number;
+}
 interface Local {
   version: 1;
   phase: "draft" | "pending" | "merge" | "active";
@@ -122,6 +126,7 @@ interface Local {
   name: string;
   root?: string;
   control?: Control;
+  snapshotRequired?: SnapshotRequirement;
   canonical: Workspace;
   queue: QueueEntry[];
   nextSequence: number;
@@ -218,6 +223,18 @@ export class Controller {
     this.persistedState = state;
     this.storageWrites++;
   }
+  private async persistSnapshotApplied() {
+    const s = this.require();
+    const requirement = s.snapshotRequired;
+    assert(requirement, "No epoch snapshot is required.");
+    delete s.snapshotRequired;
+    try {
+      await this.persist();
+    } catch (error) {
+      s.snapshotRequired = requirement;
+      throw error;
+    }
+  }
   private auth<T>(action: string, payload: unknown) {
     return this.api().authenticated<T>(action, payload, this.require().device.id, this.key());
   }
@@ -311,6 +328,21 @@ export class Controller {
       diagnosticDevice(this.local.device.id);
       requireGroupSupport(this.local.canonical);
       if (this.local.control) this.local.control = parseControl(this.local.control);
+      if (this.local.snapshotRequired) {
+        const requirement = this.local.snapshotRequired;
+        assert(
+          Number.isSafeInteger(requirement.epoch) && Number.isSafeInteger(requirement.generation),
+          "Invalid epoch snapshot requirement.",
+        );
+        if (
+          !this.local.control ||
+          requirement.epoch !== this.local.control.epoch ||
+          requirement.generation > this.local.control.generation
+        ) {
+          delete this.local.snapshotRequired;
+          await this.persist();
+        }
+      }
       await this.pruneExpiredApprovals();
       if (this.local.phase === "active") {
         await this.hydrate();
@@ -1321,7 +1353,7 @@ export class Controller {
     delete s.intent;
     await this.persist();
   }
-  private async advanceChain(raw: Control[]) {
+  private async advanceChain(raw: Control[]): Promise<boolean> {
     const s = this.require();
     assert(s.control);
     let current = s.control;
@@ -1346,18 +1378,21 @@ export class Controller {
       );
     }
     assert(sameDevice(member, s.device));
-    if (current.epoch !== s.control.epoch) {
+    const epochChanged = current.epoch !== s.control.epoch;
+    if (epochChanged) {
       const box = current.boxes[s.device.id];
       assert(this.exchange && box);
       s.root = base64(await unwrapRoot(box, this.exchange, s.handle, current.epoch, s.device.id));
+      s.snapshotRequired = { epoch: current.epoch, generation: current.generation };
     }
     s.control = current;
+    return epochChanged;
   }
   async pull(force = false) {
     const s = this.require();
     const requestedRemoteGeneration = this.remoteChanges.snapshot();
     assert(s.control);
-    let forceSnapshot = force || s.phase === "merge";
+    let forceSnapshot = force || s.phase === "merge" || !!s.snapshotRequired;
     let controlPages = 0;
     let workspacePages = 0;
     while (true) {
@@ -1372,7 +1407,8 @@ export class Controller {
       if (reply.kind === "control") {
         if (++controlPages > SYNC_MAX_CONTROL_PAGES_PER_PULL)
           throw new Error("Sync control catch-up exceeded the safe page limit. Relay will retry.");
-        if (await this.applyControlPage(reply, s.control.generation)) forceSnapshot = true;
+        forceSnapshot =
+          (await this.applyControlPage(reply, s.control.generation)) || !!s.snapshotRequired;
         continue;
       }
       if (reply.kind === "workspace") {
@@ -1411,14 +1447,13 @@ export class Controller {
         nextGeneration > requestedGeneration,
       "Invalid control continuation.",
     );
-    const previousEpoch = s.control?.epoch;
-    await this.advanceChain(reply.chain);
+    const epochChanged = await this.advanceChain(reply.chain);
     assert(
       s.control && s.control.generation === nextGeneration,
       "Invalid control continuation range.",
     );
     await this.persist();
-    return previousEpoch !== s.control.epoch;
+    return epochChanged;
   }
   private async applySyncPage(
     reply: SyncReply,
@@ -1445,9 +1480,9 @@ export class Controller {
     const previousControl = s.control;
     assert(previousControl);
     const oldEpoch = previousControl.epoch;
+    const epochChanged = reply.kind !== "workspace" ? await this.advanceChain(reply.chain) : false;
     if (reply.kind !== "workspace") {
       assert(reply.control);
-      await this.advanceChain(reply.chain);
       assert(
         s.control && canonical(parseControl(reply.control)) === canonical(s.control),
         "Membership state mismatch.",
@@ -1455,7 +1490,15 @@ export class Controller {
     }
     const currentControl = s.control;
     assert(currentControl);
-    if (oldEpoch !== currentControl.epoch && !reply.snapshot) {
+    if (epochChanged) await this.persist();
+    const requirement = s.snapshotRequired;
+    if (requirement)
+      assert(
+        requirement.epoch === currentControl.epoch &&
+          requirement.generation <= currentControl.generation,
+        "Stale epoch snapshot requirement.",
+      );
+    if ((oldEpoch !== currentControl.epoch || requirement) && !reply.snapshot) {
       // Do not apply a page encrypted under an epoch whose authenticated
       // snapshot was not supplied. The caller immediately retries with force.
       return "snapshot";
@@ -1481,14 +1524,18 @@ export class Controller {
         s.control?.epoch ?? 0,
       );
     };
+    let snapshotSatisfiedRequirement = false;
     if (reply.snapshot) {
       const snapshot = parseEnvelope(reply.snapshot);
       assert(
         snapshot.header.type === "snapshot" && snapshot.header.base >= s.canonical.revision,
         "Stale snapshot rejected.",
       );
+      if (requirement)
+        assert(snapshot.header.epoch === requirement.epoch, "Unexpected epoch snapshot.");
       canonicalState = parseWorkspace(await decrypt(snapshot));
       assert(canonicalState.revision === snapshot.header.base);
+      snapshotSatisfiedRequirement = !!requirement;
     }
     // Older servers return one complete page without continuation fields. It
     // remains safe to accept only after the existing full-revision checks; an
@@ -1526,7 +1573,8 @@ export class Controller {
     // Persist each contiguous page. If the extension worker terminates, the
     // next signed request resumes from this canonical revision without losing
     // locally queued operations or acknowledging them prematurely.
-    await this.persist();
+    if (snapshotSatisfiedRequirement) await this.persistSnapshotApplied();
+    else await this.persist();
     if (more) return "more";
     assert(canonicalState.revision === revision, "Workspace revision mismatch.");
     assert(
