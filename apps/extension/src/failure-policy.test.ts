@@ -13,6 +13,10 @@ describe("controller failure policy", () => {
       category: "BROWSER_RUNTIME_RACE",
       disposition: "transient",
     });
+    expect(failurePolicy(new Error("No current window."))).toMatchObject({
+      category: "BROWSER_RUNTIME_RACE",
+      disposition: "transient",
+    });
     expect(failurePolicy(new ApiError(0, "offline"))).toMatchObject({
       category: "NETWORK",
       disposition: "transient",

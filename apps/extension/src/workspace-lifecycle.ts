@@ -61,6 +61,15 @@ export function restoreMapping(
   );
   const usedWindows = new Set<string>();
   const usedTabs = new Set<string>();
+  const deletedByWindow = new Map<string, Map<string, string[]>>();
+  for (const tab of Object.values(previous.observed.tabs)) {
+    if (target.tabs[tab.id]) continue;
+    const bySignature = deletedByWindow.get(tab.window) ?? new Map<string, string[]>();
+    const matches = bySignature.get(tabSignature(tab)) ?? [];
+    matches.push(tab.id);
+    bySignature.set(tabSignature(tab), matches);
+    deletedByWindow.set(tab.window, bySignature);
+  }
   const assign = (window: ObservedWindow, key: string) => {
     seed.windows[window.local] = key;
     usedWindows.add(key);
@@ -109,6 +118,14 @@ export function restoreMapping(
         do {
           logical = matches?.pop();
         } while (logical && usedTabs.has(logical));
+      }
+      if (!logical) {
+        const matches = deletedByWindow.get(key)?.get(signature(kind, tab.pinned)) ?? [];
+        const available = matches.filter((id) => !usedTabs.has(id));
+        // A fresh browser session has no stable tab IDs. Reuse only an unambiguous
+        // prior identity so reconcile can apply the remote delete; ambiguous tabs
+        // remain local rather than risking a destructive wrong-tab close.
+        if (available.length === 1) logical = available[0];
       }
       if (logical) {
         seed.tabs[tab.local] = logical;
