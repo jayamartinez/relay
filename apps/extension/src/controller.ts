@@ -58,6 +58,7 @@ import {
   SYNC_MAX_CONTROL_PAGES_PER_PULL,
   SYNC_MAX_WORKSPACE_PAGES_PER_PULL,
   serverOrigin,
+  syncableTab,
   text,
 } from "@relay/shared";
 import { Api, ApiError } from "./api";
@@ -483,6 +484,7 @@ export class Controller {
     );
     s.mapping = restored.mapping;
     await this.enqueue(restored.changes, "STARTUP");
+    await this.flush(true);
     s.intent = this.projected();
     await this.applyBrowser(s.intent);
     if (this.events.closing) {
@@ -543,7 +545,15 @@ export class Controller {
     const s = this.local;
     const id = s?.mapping.tabs[local];
     const previous = id ? s.mapping.observed.tabs[id] : undefined;
-    if (!s || !id || !previous || navigationKey(previous) === url) return;
+    const navigation = syncableTab(url, false, ownOrigin());
+    if (
+      !s ||
+      !id ||
+      !previous ||
+      !navigation ||
+      navigationKey(previous) === navigationKey(navigation)
+    )
+      return;
     const intent = recordLocalIntent(s.mapping, id, {
       kind: "navigate",
       url,
@@ -1221,7 +1231,7 @@ export class Controller {
         change.type === "tab-create" ? change.tab.id : "id" in change ? change.id : undefined;
       if (logical) {
         const intent = s.mapping.freshness?.intents[logical];
-        if (intent) intent.journaled = true;
+        if (intent && this.matchesLocalIntent(change, intent)) intent.journaled = true;
       }
       if (change.type === "tab-navigate" || change.type === "tab-create") {
         const tabId = change.type === "tab-create" ? change.tab.id : change.id;
@@ -1243,6 +1253,85 @@ export class Controller {
       );
     }
     await this.persist();
+  }
+  private matchesLocalIntent(
+    change: Change,
+    intent: NonNullable<Mapping["freshness"]>["intents"][string],
+  ) {
+    if (intent.kind === "delete") return change.type === "tab-delete";
+    if (change.type !== "tab-create" && change.type !== "tab-navigate") return false;
+    const navigation = change.type === "tab-create" ? change.tab : change;
+    const intentKey = this.localIntentNavigationKey(intent);
+    return intentKey !== undefined && navigationKey(navigation) === intentKey;
+  }
+  private localIntentNavigationKey(intent: NonNullable<Mapping["freshness"]>["intents"][string]) {
+    if (!intent.url) return undefined;
+    const navigation = syncableTab(intent.url, false, ownOrigin());
+    return navigation ? navigationKey(navigation) : intent.url;
+  }
+  private async journalDurableIntents() {
+    const s = this.require();
+    const intents = s.mapping.freshness?.intents;
+    if (!intents) return;
+    const changes: Change[] = [];
+    for (const [id, intent] of Object.entries(intents)) {
+      const canonical = s.canonical.tabs[id];
+      if (intent.kind === "delete") {
+        if (canonical && !this.hasPendingIntentChange(id, intent, "tab-delete"))
+          changes.push({ type: "tab-delete", id });
+        continue;
+      }
+      const intentKey = this.localIntentNavigationKey(intent);
+      if (!intent.url || !intentKey || (canonical && navigationKey(canonical) === intentKey))
+        continue;
+      const tab = syncableTab(intent.url, false, ownOrigin());
+      if (!tab) continue;
+      if (canonical) {
+        if (!this.hasPendingIntentChange(id, intent, "tab-navigate"))
+          changes.push({ type: "tab-navigate", id, ...tab, source: s.device.id });
+        continue;
+      }
+      if (this.hasPendingIntentChange(id, intent, "tab-create")) continue;
+      const observed = s.mapping.observed.tabs[id];
+      const window = observed && s.mapping.observed.windows[observed.window];
+      if (!observed || !window || navigationKey(observed) !== intentKey) continue;
+      if (
+        !s.canonical.windows[window.id] &&
+        !changes.some((change) => change.type === "window-create" && change.id === window.id)
+      )
+        changes.push({ type: "window-create", id: window.id, order: window.order });
+      changes.push({
+        type: "tab-create",
+        tab: {
+          id,
+          window: observed.window,
+          index: observed.index,
+          pinned: observed.pinned,
+          ...tab,
+          source: s.device.id,
+          changed: s.canonical.revision,
+        },
+      });
+    }
+    await this.enqueue(changes, "STARTUP");
+  }
+  private hasPendingIntentChange(
+    id: string,
+    intent: NonNullable<Mapping["freshness"]>["intents"][string],
+    type: Change["type"],
+  ) {
+    return this.require().queue.some((entry) =>
+      entry.operation.changes.some(
+        (change) =>
+          change.type === type &&
+          (change.type === "tab-create"
+            ? change.tab.id
+            : "id" in change
+              ? change.id
+              : undefined) === id &&
+          this.matchesLocalIntent(change, intent),
+      ),
+    );
   }
   async captureLocal() {
     const s = this.local;
@@ -1337,7 +1426,9 @@ export class Controller {
           const intent = freshness?.intents[tab.id];
           if (!intent) return true;
           if (intent.kind === "delete") return false;
-          return mutation !== "navigate" || navigationKey(tab) === intent.url;
+          return (
+            mutation !== "navigate" || navigationKey(tab) === this.localIntentNavigationKey(intent)
+          );
         },
         (tab) => {
           const intent = tab ? s.mapping.freshness?.intents[tab.id] : undefined;
@@ -1622,6 +1713,8 @@ export class Controller {
       s.phase === "active" &&
       !s.paused &&
       this.lifecycle === "LIVE" &&
+      s.queue.length === 0 &&
+      Object.keys(s.mapping.freshness?.intents ?? {}).length === 0 &&
       Date.now() >= this.events.readyAt
     )
       await this.applyBrowser(this.projected());
@@ -1645,23 +1738,37 @@ export class Controller {
       const canonical = s.canonical.tabs[id];
       // A signed pull acknowledging our sequence makes the canonical outcome
       // deterministic. It may be our local value or a later concurrent winner.
-      if (intent.kind === "delete" ? !canonical : true) delete intents[id];
+      if (
+        intent.kind === "delete"
+          ? !canonical
+          : !!canonical && navigationKey(canonical) === this.localIntentNavigationKey(intent)
+      )
+        delete intents[id];
     }
   }
-  async flush() {
+  async flush(recovering = false) {
     const s = this.local;
     if (
       !s ||
       s.phase !== "active" ||
       s.paused ||
       this.halted ||
-      this.lifecycle !== "LIVE" ||
+      (this.lifecycle !== "LIVE" && !(recovering && this.lifecycle === "RECONCILING")) ||
       this.events.closing
     )
       return;
     await this.pull();
+    // The pull above validates control, epoch, snapshot, and the latest signed
+    // canonical base without reconciling over protected local work. Repair any
+    // legacy intent whose matching journal entry was lost before taking the queue
+    // snapshot, so every recovery entry point can make that intent canonical.
+    await this.journalDurableIntents();
     for (const entry of [...s.queue]) {
-      if (this.events.closing || this.lifecycle !== "LIVE") return;
+      if (
+        this.events.closing ||
+        (this.lifecycle !== "LIVE" && !(recovering && this.lifecycle === "RECONCILING"))
+      )
+        return;
       const envelope = await this.envelope(
         "operation",
         entry.sequence,
