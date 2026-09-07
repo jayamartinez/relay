@@ -154,6 +154,16 @@ describe("Explicit enrollment and device lifetime semantics", () => {
     expect(restored.mapping.tabs).toEqual({ 70: "a", 71: "b", 72: "c" });
     expect(restored.changes).toEqual([]);
   });
+  it("keeps a same-session remote deletion bound for reconcile instead of reimporting it", () => {
+    const previous = mapping(state(["a"]));
+    const target = state([]);
+
+    const restored = restoreMapping([window(1, ["a"])], previous, target, "old", "B", origin);
+
+    expect(restored.mapping.tabs).toEqual({ 10: "a" });
+    expect(restored.mapping.observed.tabs.a).toBeDefined();
+    expect(restored.changes).toEqual([]);
+  });
   it("normal LIVE observation can still import a genuinely created second window", () => {
     const original = mapping();
     const result = observe([window(1, ["a", "b"]), window(2, ["c"])], original, "old", "B", origin);
