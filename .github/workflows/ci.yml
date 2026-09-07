@@ -66,3 +66,32 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+
+  deploy-production:
+    name: Deploy / Production
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.quality.result == 'success' &&
+      needs.tests.result == 'success' &&
+      needs.build.result == 'success'
+    needs:
+      - quality
+      - tests
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.20.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.12.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @relay/server deploy:production
