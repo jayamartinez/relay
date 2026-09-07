@@ -225,6 +225,27 @@ export async function reconcile(
   const localTabs = new Map(
     Object.entries(next.tabs).map(([local, sync]) => [sync, Number(local)]),
   );
+  const sameObservedTab = (
+    tab: Pick<chrome.tabs.Tab, "incognito" | "url" | "pendingUrl" | "pinned">,
+    previous: Mapping["observed"]["tabs"][string],
+  ) => {
+    if (tab.incognito) return false;
+    const classified = classifyTab(tab.pendingUrl ?? tab.url);
+    return (
+      classified?.kind === previous.kind &&
+      (!isWeb(previous.kind) || classified.url === previous.url) &&
+      tab.pinned === previous.pinned
+    );
+  };
+  const currentTab = async (local: number) => {
+    try {
+      return await chrome.tabs.get(local);
+    } catch (error) {
+      if (error instanceof Error && /^(No tab with id:|The tab was closed)/i.test(error.message))
+        return undefined;
+      throw error;
+    }
+  };
   for (const window of Object.values(target.windows).sort((a, b) => a.order - b.order)) {
     if (!allowed()) throw new BrowserRuntimeRaceError();
     const desired = tabsIn(target, window.id);
@@ -328,24 +349,76 @@ export async function reconcile(
   for (const [localText, logical] of Object.entries(next.tabs)) {
     if (!allowed()) throw new BrowserRuntimeRaceError();
     if (target.tabs[logical]) continue;
-    const local = Number(localText);
-    // Re-read identity at the destructive boundary. The initial snapshot can be
-    // stale after hundreds of awaited API calls or a navigation during apply.
-    const liveTab = actualTabs.has(local) ? await chrome.tabs.get(local) : undefined;
-    if (!allowed()) throw new BrowserRuntimeRaceError();
-    const live = liveTab ? observedTab(liveTab) : undefined;
+    let local = Number(localText);
     const previous = mapping.observed.tabs[logical];
-    // Never close an untracked, incognito, or identity-mismatched tab.
-    if (live && previous && !live.incognito) {
-      const classified = classifyTab(live.url);
-      const placeholder = live.url === `${ownOrigin()}/placeholder.html#${logical}`;
-      const safe =
-        placeholder ||
-        (classified?.kind === previous.kind &&
-          (!isWeb(previous.kind) || classified.url === previous.url));
-      if (safe) await chrome.tabs.remove(local);
+    // Re-read identity at the destructive boundary. A persisted native ID can be
+    // stale after browser restore, lock/sleep, or reconnect. Only rebind it when
+    // exactly one current tab has the prior safe identity in the mapped window.
+    let liveTab = await currentTab(local);
+    if (!liveTab && previous) {
+      const refreshed = await browserWindows();
+      const candidates = refreshed
+        .filter((window) => next.windows[String(window.local)] === previous.window)
+        .flatMap((window) => window.tabs)
+        .filter((tab) => sameObservedTab(tab, previous));
+      if (candidates.length === 1) {
+        local = candidates[0]!.local;
+        liveTab = await currentTab(local);
+      }
+    }
+    if (!allowed()) throw new BrowserRuntimeRaceError();
+    const placeholder =
+      liveTab?.url === `${ownOrigin()}/placeholder.html#${logical}` ||
+      liveTab?.pendingUrl === `${ownOrigin()}/placeholder.html#${logical}`;
+    if (!liveTab || !previous || (!placeholder && !sameObservedTab(liveTab, previous))) {
+      trace(
+        "REMOTE",
+        "TAB_DELETE",
+        "SUPPRESS",
+        logical,
+        operationId,
+        `local:${local};result:blocked;mapping:kept;exists:${!!liveTab}`,
+      );
+      throw new BrowserRuntimeRaceError("Relay could not safely resolve the tab to delete.");
+    }
+    trace("REMOTE", "TAB_DELETE", "APPLY", logical, operationId, `local:${local};attempt`);
+    try {
+      await chrome.tabs.remove(local);
+    } catch (error) {
+      if (await currentTab(local)) {
+        trace(
+          "REMOTE",
+          "TAB_DELETE",
+          "SUPPRESS",
+          logical,
+          operationId,
+          `local:${local};result:failed;mapping:kept;exists:true`,
+        );
+        throw new BrowserRuntimeRaceError("Chromium did not remove the requested tab.", {
+          cause: error,
+        });
+      }
+    }
+    if (await currentTab(local)) {
+      trace(
+        "REMOTE",
+        "TAB_DELETE",
+        "SUPPRESS",
+        logical,
+        operationId,
+        `local:${local};result:still-present;mapping:kept;exists:true`,
+      );
+      throw new BrowserRuntimeRaceError("Chromium kept the requested tab open.");
     }
     delete next.tabs[localText];
+    trace(
+      "REMOTE",
+      "TAB_DELETE",
+      "DETECTED",
+      logical,
+      operationId,
+      `local:${local};result:removed;mapping:removed;exists:false`,
+    );
   }
   for (const [local, logical] of Object.entries(next.windows))
     if (!target.windows[logical]) delete next.windows[local];
@@ -361,7 +434,6 @@ export async function reconcile(
     if (!target.tabs[key]) delete next.navigation![key];
   // No windows.remove: it could close unrelated local/extension tabs. Chrome closes an emptied window.
   await reconcileGroups(target, next, persist, allowed);
-  next.observed = target;
   const observed = observe(await browserWindows(), next, await sessionId(), source, ownOrigin());
   await persist(observed.mapping);
   return observed.mapping;

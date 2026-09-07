@@ -31,6 +31,14 @@ function fixture(existing: boolean) {
     return { ...live[0], url: undefined };
   });
   const update = vi.fn();
+  const get = vi.fn(async (id: number) => {
+    const tab = live.find((candidate) => candidate.id === id);
+    if (tab) return tab;
+    throw new Error(`No tab with id: ${id}`);
+  });
+  const remove = vi.fn(async (id: number) => {
+    live = live.filter((tab) => tab.id !== id);
+  });
   vi.stubGlobal("chrome", {
     runtime: { getURL: () => "chrome-extension://relay/" },
     storage: { session: { get: async () => ({ browserSession: "session" }) } },
@@ -38,10 +46,10 @@ function fixture(existing: boolean) {
     tabs: {
       create,
       update,
-      get: async () => live[0],
+      get,
       query: async () => live,
       move: vi.fn(),
-      remove: vi.fn(),
+      remove,
     },
   });
   const mapping: Mapping = {
@@ -51,7 +59,17 @@ function fixture(existing: boolean) {
     expected: [],
     observed: existing ? target : { ...target, tabs: {} },
   };
-  return { target, mapping, create, update };
+  return {
+    target,
+    mapping,
+    create,
+    update,
+    remove,
+    setLive: (tabs: typeof live) => {
+      live = tabs;
+    },
+    live: () => live,
+  };
 }
 it("does not navigate again after create returns an initializing tab without URL metadata", async () => {
   const f = fixture(false);
@@ -128,8 +146,56 @@ it("does not replay a stale deletion after a tab navigates during reconciliation
       }) as chrome.tabs.Tab,
   );
   chrome.tabs.get = get as typeof chrome.tabs.get;
-  await reconcile({ ...f.target, tabs: {} }, f.mapping, "device", async () => {});
+  await expect(
+    reconcile({ ...f.target, tabs: {} }, f.mapping, "device", async () => {}),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
   expect(chrome.tabs.remove).not.toHaveBeenCalled();
+});
+
+it("keeps a remote delete pending until Chromium confirms removal, then converges on retry", async () => {
+  const f = fixture(true);
+  const target = { ...f.target, tabs: {} };
+  const persisted: Mapping[] = [];
+  f.remove.mockImplementationOnce(async () => {
+    throw new Error("tab removal failed while browser was suspended");
+  });
+
+  await expect(
+    reconcile(target, f.mapping, "device", async (mapping) => {
+      persisted.push(mapping);
+    }),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+
+  expect(f.live()).toHaveLength(1);
+  expect(persisted.at(-1)!.tabs[7]).toBe("tab");
+  expect(persisted.at(-1)!.observed.tabs.tab).toBeDefined();
+
+  const converged = await reconcile(target, persisted.at(-1)!, "device", async () => {});
+  expect(f.remove).toHaveBeenCalledTimes(2);
+  expect(f.live()).toEqual([]);
+  expect(converged.tabs[7]).toBeUndefined();
+  expect(converged.observed.tabs.tab).toBeUndefined();
+});
+
+it("rebinds a uniquely matched restored tab before applying a remote delete", async () => {
+  const f = fixture(true);
+  f.setLive([
+    {
+      id: 27,
+      windowId: 1,
+      index: 0,
+      pinned: false,
+      incognito: false,
+      url: f.target.tabs.tab.url,
+    },
+  ]);
+
+  const mapping = await reconcile({ ...f.target, tabs: {} }, f.mapping, "device", async () => {});
+
+  expect(f.remove).toHaveBeenCalledWith(27);
+  expect(f.live()).toEqual([]);
+  expect(mapping.tabs[7]).toBeUndefined();
+  expect(mapping.observed.tabs.tab).toBeUndefined();
 });
 
 it("does not recreate a tab when a user close supersedes a stale reconcile plan", async () => {

@@ -61,6 +61,15 @@ export function restoreMapping(
   );
   const usedWindows = new Set<string>();
   const usedTabs = new Set<string>();
+  const deletedByWindow = new Map<string, Map<string, string[]>>();
+  for (const tab of Object.values(previous.observed.tabs)) {
+    if (target.tabs[tab.id]) continue;
+    const bySignature = deletedByWindow.get(tab.window) ?? new Map<string, string[]>();
+    const matches = bySignature.get(tabSignature(tab)) ?? [];
+    matches.push(tab.id);
+    bySignature.set(tabSignature(tab), matches);
+    deletedByWindow.set(tab.window, bySignature);
+  }
   const assign = (window: ObservedWindow, key: string) => {
     seed.windows[window.local] = key;
     usedWindows.add(key);
@@ -100,12 +109,23 @@ export function restoreMapping(
     if (!key) continue;
     for (const { tab, kind } of portableByWindow.get(window.local)!) {
       let logical = previous.session === session ? previous.tabs[tab.local] : undefined;
-      if (!logical || !target.tabs[logical] || usedTabs.has(logical)) {
+      // A same-session binding remains authoritative while a remote delete is
+      // pending. Dropping it here would turn the still-open physical tab into a
+      // fresh local create before reconcile gets the chance to remove it.
+      if (!logical || usedTabs.has(logical)) {
         const value = signature(kind, tab.pinned);
         const matches = indexed.get(key)!.bySignature.get(value);
         do {
           logical = matches?.pop();
         } while (logical && usedTabs.has(logical));
+      }
+      if (!logical) {
+        const matches = deletedByWindow.get(key)?.get(signature(kind, tab.pinned)) ?? [];
+        const available = matches.filter((id) => !usedTabs.has(id));
+        // A fresh browser session has no stable tab IDs. Reuse only an unambiguous
+        // prior identity so reconcile can apply the remote delete; ambiguous tabs
+        // remain local rather than risking a destructive wrong-tab close.
+        if (available.length === 1) logical = available[0];
       }
       if (logical) {
         seed.tabs[tab.local] = logical;
@@ -139,10 +159,13 @@ export function restoreMapping(
   // Existing numeric tab IDs not in canonical state can be retained only within this session.
   // Observe allocates new IDs for genuinely unmatched local tabs, never for mapped windows.
   const observed = observe(actual, seed, session, source, origin).mapping;
+  const pendingDeletes = new Set(
+    Object.values(seed.tabs).filter((id) => !target.tabs[id] && !!previous.observed.tabs[id]),
+  );
   const changes: Change[] = [];
   const appended = new Map<string, number>();
   for (const tab of Object.values(observed.observed.tabs))
-    if (!target.tabs[tab.id]) {
+    if (!target.tabs[tab.id] && !pendingDeletes.has(tab.id)) {
       const index = (indexed.get(tab.window)?.tabs.length ?? 0) + (appended.get(tab.window) ?? 0);
       appended.set(tab.window, (appended.get(tab.window) ?? 0) + 1);
       changes.push({ type: "tab-create", tab: { ...tab, index } });
