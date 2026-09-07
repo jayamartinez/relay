@@ -76,6 +76,7 @@ export interface NavigationReceipt {
   previousUrl?: string;
   expires: number;
   completeAt?: number;
+  superseded?: boolean;
   settledUrl?: string;
   redirects?: string[];
   source?: "USER" | "REMOTE";

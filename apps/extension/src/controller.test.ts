@@ -20,6 +20,7 @@ import { ApiError } from "./api";
 import { browserWindows, capture, reconcile, sessionId } from "./browser";
 import { BrowserRuntimeRaceError } from "./browser-runtime";
 import { Controller } from "./controller";
+import { expectNavigation } from "./navigation";
 import { SerialTaskQueue } from "./serial-task-queue";
 import { StorageInterruptedError } from "./storage-runtime";
 import * as vault from "./vault";
@@ -1090,6 +1091,99 @@ describe("durable local intent recovery", () => {
         source: "remote",
       },
     },
+  });
+
+  function browsing() {
+    const c = setup();
+    const s = c["local"]!;
+    s.canonical = workspace("https://example.com/A");
+    s.mapping.observed = structuredClone(s.canonical);
+    s.mapping.tabs = { 7: "t" };
+    s.mapping.windows = { 1: "w" };
+    return c;
+  }
+  it("protects commit-only and rapid A/B/A navigation immediately, preserving a later close", async () => {
+    const c = browsing();
+    await c.navigationCommitted(7, "https://example.com/B", "link", []);
+    expect(c["local"]!.mapping.freshness?.intents.t?.url).toBe("https://example.com/B");
+    await c.navigationCommitted(7, "https://example.com/A", "history", []);
+    expect(c["local"]!.mapping.freshness?.intents.t?.url).toBe("https://example.com/A");
+    await c.tabRemoved(7, 1, false);
+    await c.navigationEvent(7, "https://example.com/B", true);
+    expect(c["local"]!.mapping.freshness?.intents.t?.kind).toBe("delete");
+  });
+  it("does not journal a provisional receiver redirect before commit metadata or echo it afterwards", async () => {
+    const c = browsing();
+    const s = c["local"]!;
+    expectNavigation(s.mapping, s.canonical.tabs.t!, 7, undefined, "remote");
+    await c.navigationEvent(7, "https://example.com/redirect", false);
+    await c["journalDurableIntents"]();
+    expect(s.queue).toHaveLength(0);
+    await c.navigationCommitted(7, "https://example.com/redirect", "link", ["server_redirect"]);
+    await c.navigationEvent(7, "https://example.com/redirect", true);
+    expect(s.mapping.freshness?.intents.t).toBeUndefined();
+    await c["journalDurableIntents"]();
+    expect(s.queue).toHaveLength(0);
+    await c.navigationCommitted(7, "https://example.com/later-click", "link", ["server_redirect"]);
+    expect(s.mapping.freshness?.intents.t?.url).toBe("https://example.com/later-click");
+  });
+  it("preserves newer navigation and close intent received while capture awaits topology", async () => {
+    const c = browsing();
+    c.events.changed(0);
+    vi.mocked(capture).mockImplementationOnce(async (mapping) => {
+      const old = structuredClone(mapping);
+      await c.navigationEvent(7, "https://example.com/C", true);
+      await c.tabRemoved(7, 1, false);
+      return { mapping: old, changes: [], bootstrap: false, shutdown: false };
+    });
+    await c.captureLocal();
+    expect(c["local"]!.mapping.freshness?.intents.t?.kind).toBe("delete");
+    const saved = vi.mocked(vault.saveState).mock.calls.at(-1)![0] as (typeof c)["local"];
+    expect(saved!.mapping.freshness?.intents.t?.kind).toBe("delete");
+  });
+  it("settles an A/B/A intent already satisfied by canonical state without leaving reconnect blocked", async () => {
+    const c = browsing();
+    await c.navigationEvent(7, "https://example.com/B", false);
+    await c.navigationEvent(7, "https://example.com/A", true);
+    c.events.take(Date.now() + 1000);
+    await c["journalDurableIntents"]();
+    expect(c["local"]!.queue).toHaveLength(0);
+    expect(c["local"]!.mapping.freshness?.intents.t).toBeUndefined();
+  });
+  it("does not replace a newer intent while a stale reconcile mapping persists", async () => {
+    const c = browsing();
+    const s = c["local"]!;
+    const target = workspace("https://example.com/remote");
+    vi.mocked(reconcile).mockImplementationOnce(
+      async (_target, mapping, _source, persist, allowed) => {
+        const stale = structuredClone(mapping);
+        await c.navigationCommitted(7, "https://example.com/C", "history", []);
+        await persist(stale);
+        expect(allowed?.(target.tabs.t, "navigate")).toBe(false);
+        throw new BrowserRuntimeRaceError();
+      },
+    );
+    await expect(c["applyBrowser"](target)).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+    expect(s.mapping.freshness?.intents.t?.url).toBe("https://example.com/C");
+  });
+  it("serializes encrypted snapshots so an older slow write cannot replace newer durable intent", async () => {
+    const c = browsing();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.mocked(vault.saveState).mockImplementationOnce(async () => blocked);
+    const first = c.navigationEvent(7, "https://example.com/B", false);
+    await Promise.resolve();
+    await Promise.resolve();
+    const calls = vi.mocked(vault.saveState).mock.calls.length;
+    const second = c.navigationEvent(7, "https://example.com/C", true);
+    await Promise.resolve();
+    expect(vi.mocked(vault.saveState).mock.calls.length).toBe(calls);
+    release();
+    await Promise.all([first, second]);
+    const saved = vi.mocked(vault.saveState).mock.calls.at(-1)![0] as (typeof c)["local"];
+    expect(saved!.mapping.freshness?.intents.t?.url).toBe("https://example.com/C");
   });
 
   it("does not journal or retire navigation intent for an unrelated tab move", async () => {

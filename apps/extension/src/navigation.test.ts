@@ -139,3 +139,41 @@ describe("Persistent navigation ownership", () => {
     expect(events.take(600)!.commits?.get(7)?.qualifiers).toEqual(["server_redirect"]);
   });
 });
+
+it("retains known remote completion ownership across sleep without suppressing a later Back", () => {
+  vi.useFakeTimers();
+  const m = mapping();
+  expectNavigation(m, tab, 7, "https://example.com/old", "remote-op");
+  remoteNavigationEvent(m, 7, tab.url!, true);
+  vi.advanceTimersByTime(120_000);
+  const restored = structuredClone(m);
+  expect(remoteNavigationEvent(restored, 7, tab.url!, true)).toBe(true);
+  committedNavigation(restored, 7, "https://example.com/old", "link", ["forward_back"]);
+  expect(remoteNavigationEvent(restored, 7, "https://example.com/old", true)).toBe(false);
+});
+
+it("does not treat a redirect from a local journal receipt as a Relay browser mutation", () => {
+  const m = mapping();
+  expectNavigation(m, tab, 7, undefined, "local-op", "USER");
+  expect(committedNavigation(m, 7, "https://example.com/final", "link", ["server_redirect"])).toBe(
+    false,
+  );
+  expect(remoteNavigationEvent(m, 7, "https://example.com/final", true)).toBe(false);
+});
+
+it("keeps the reversal circuit effective when a site repeatedly routes away from the same remote target", () => {
+  const m = mapping();
+  const route = "https://example.com/automatic-route";
+  for (let attempt = 0; attempt < 4; attempt++) {
+    expectNavigation(m, tab, 7, undefined, `remote-${attempt}`);
+    remoteNavigationEvent(m, 7, tab.url!, true);
+    committedNavigation(m, 7, route, "history", []);
+    expect(remoteNavigationEvent(m, 7, route, true)).toBe(false);
+    expect(
+      navigationCircuit(
+        [{ type: "tab-navigate", id: tab.id, kind: "web", url: route, source: "device" }],
+        m,
+      ),
+    ).toBe(attempt === 3);
+  }
+});
