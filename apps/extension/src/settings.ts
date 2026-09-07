@@ -2,6 +2,8 @@
 import { serverOrigin } from "@relay/shared";
 import { formatRelayBuild } from "./build-info";
 import type { Status } from "./controller";
+import { watchStatus } from "./status-channel";
+import { statusViewKey } from "./status-view";
 import {
   ago,
   brand,
@@ -27,6 +29,7 @@ let screen = "welcome";
 let section = "General";
 let busy = false;
 let lastView = "";
+let refreshing = false;
 let revealed = false;
 let nameValue = navigator.userAgent.includes("Windows")
   ? "Windows Desktop"
@@ -724,28 +727,37 @@ function render() {
       "Relay is an independent project, not affiliated with or endorsed by Helium. Your active tab and window layout stay yours.",
     ),
   );
-  lastView = JSON.stringify(state);
+  lastView = statusViewKey(state);
 }
 async function refresh() {
-  if (busy || document.hidden) return;
+  if (busy || refreshing || document.hidden) return;
+  refreshing = true;
   try {
     const next = await call("status", { poll: state?.phase === "pending" });
-    const changed = JSON.stringify(next) !== lastView;
+    const changed = statusViewKey(next) !== lastView;
     state = next;
     if (changed && document.activeElement?.tagName !== "INPUT") render();
   } catch (error) {
     report(error);
+  } finally {
+    refreshing = false;
   }
 }
-const statusPort = chrome.runtime.connect({ name: "relay-status" });
-statusPort.onMessage.addListener((message) => {
-  if (message?.type === "status-changed") void refresh();
+watchStatus(() => {
+  if (state) void refresh();
 });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) void refresh();
+});
+window.addEventListener("focus", () => void refresh());
 void call("status")
   .then((value) => {
     state = value;
     serverValue = value.server;
     render();
-    setInterval(() => void refresh(), 3000);
+    // Pending requesters have no live socket yet. Active accounts receive events.
+    setInterval(() => {
+      if (state.phase === "pending") void refresh();
+    }, 3000);
   })
   .catch(report);
