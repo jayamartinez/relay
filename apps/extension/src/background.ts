@@ -16,8 +16,10 @@ function broadcastStatusChanged() {
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "relay-status" || port.sender?.id !== chrome.runtime.id) return;
   statusPorts.add(port);
+  port.postMessage({ type: "status-changed" });
   port.onDisconnect.addListener(() => statusPorts.delete(port));
 });
+controller.statusChanged = broadcastStatusChanged;
 const serial = new SerialTaskQueue();
 controller.pendingTasks = () => serial.pending;
 function run<T>(task: () => Promise<T>): Promise<T> {
@@ -52,6 +54,7 @@ function schedule() {
     () => {
       browserTaskQueued = true;
       void run(() => controller.browserChanged())
+        .then(broadcastStatusChanged)
         .catch(() => {})
         .finally(() => {
           browserTaskQueued = false;
@@ -63,14 +66,18 @@ function schedule() {
 }
 chrome.tabs.onCreated.addListener(changed);
 chrome.tabs.onRemoved.addListener((id, info) => {
-  controller.tabRemoved(id, info.windowId, info.isWindowClosing);
+  void controller
+    .tabRemoved(id, info.windowId, info.isWindowClosing)
+    ?.catch((error) => controller.failure(error));
   schedule();
 });
 chrome.tabs.onUpdated.addListener((id, change, tab) => {
   if (change.url !== undefined || change.status === "complete") {
     const url = change.url ?? tab.pendingUrl ?? tab.url;
     if (url) {
-      controller.navigationEvent(id, url, change.status === "complete");
+      void controller
+        .navigationEvent(id, url, change.status === "complete")
+        .catch((error) => controller.failure(error));
       schedule();
     }
   }
@@ -78,14 +85,23 @@ chrome.tabs.onUpdated.addListener((id, change, tab) => {
 });
 chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId === 0) {
-    controller.navigationCommitted(
-      details.tabId,
-      details.url,
-      details.transitionType,
-      details.transitionQualifiers,
-    );
+    void controller
+      .navigationCommitted(
+        details.tabId,
+        details.url,
+        details.transitionType,
+        details.transitionQualifiers,
+      )
+      .catch((error) => controller.failure(error));
     schedule();
   }
+});
+chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+  if (details.frameId !== 0) return;
+  void controller
+    .navigationCommitted(details.tabId, details.url, "history", [])
+    .catch((error) => controller.failure(error));
+  schedule();
 });
 if (groupsAvailable()) {
   chrome.tabGroups.onCreated.addListener(changed);
@@ -116,7 +132,10 @@ chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === "install") void chrome.runtime.openOptionsPage();
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "relay-reconnect") void run(() => controller.watchdog()).catch(() => {});
+  if (alarm.name === "relay-reconnect")
+    void run(() => controller.watchdog())
+      .then(broadcastStatusChanged)
+      .catch(() => {});
   if (alarm.name === APPROVAL_EXPIRY_ALARM)
     void run(() => controller.expireApprovals())
       .then(broadcastStatusChanged)

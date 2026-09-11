@@ -3,6 +3,8 @@
 import { adjacentApprovalId, approvalPosition, currentApproval, SingleFlight } from "./approval-ui";
 import { formatRelayBuild } from "./build-info";
 import type { Status } from "./controller";
+import { watchStatus } from "./status-channel";
+import { statusViewKey } from "./status-view";
 import { ago, brand, button, call, countLabel, el, groupedCode, masked, statusBadge } from "./ui";
 
 declare const __PRODUCT_VERSION__: string;
@@ -235,7 +237,9 @@ function render() {
 }
 
 function update(next: Status) {
+  const changed = !state || statusViewKey(state) !== statusViewKey(next);
   state = next;
+  if (!changed) return;
   if (selectedId && !state.approvals.some((request) => request.id === selectedId))
     selectedId = undefined;
   render();
@@ -304,9 +308,8 @@ async function reconcile() {
   }
 }
 
-const port = chrome.runtime.connect({ name: "relay-status" });
-port.onMessage.addListener((message) => {
-  if (message?.type === "status-changed" && !document.hidden)
+watchStatus(() => {
+  if (!document.hidden)
     void call("status").then(update).then(prepareCurrentRequest).catch(showError);
 });
 void call("status").then(update).then(reconcile).catch(showError);

@@ -259,3 +259,77 @@ it("does not restore an old URL while a discarded tab is waking into a user navi
   ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
   expect(f.update).not.toHaveBeenCalled();
 });
+
+it("rechecks navigation freshness after the receipt persistence await", async () => {
+  const f = fixture(true);
+  const target = {
+    ...f.target,
+    tabs: { tab: { ...f.target.tabs.tab, url: "https://example.com/remote" } },
+  };
+  let current = true;
+  await expect(
+    reconcile(
+      target,
+      f.mapping,
+      "device",
+      async (mapping) => {
+        if (mapping.navigation?.tab) current = false;
+      },
+      () => current,
+    ),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+  expect(f.update).not.toHaveBeenCalled();
+});
+
+it("confirms an absent delete while another tab still needs reconciliation", async () => {
+  const f = fixture(true);
+  const other = { ...f.target.tabs.tab, id: "other", url: "https://example.com/other" };
+  f.mapping.observed = { ...f.target, tabs: { ...f.target.tabs, other } };
+  f.mapping.tabs[8] = "other";
+  f.setLive([{ ...f.live()[0]!, id: 8, url: other.url }]);
+  const target = { ...f.target, tabs: { other: { ...other, pinned: true } } };
+  const result = await reconcile(target, f.mapping, "device", async () => {});
+  expect(result.tabs[7]).toBeUndefined();
+  expect(result.tabs[8]).toBe("other");
+  expect(f.remove).not.toHaveBeenCalled();
+});
+
+it("does not steal another logical tab's native ID to recover a stale delete", async () => {
+  const f = fixture(true);
+  const other = { ...f.target.tabs.tab, id: "other" };
+  f.mapping.observed = { ...f.target, tabs: { ...f.target.tabs, other } };
+  f.mapping.tabs[8] = "other";
+  f.setLive([{ ...f.live()[0]!, id: 8 }]);
+  const result = await reconcile(
+    { ...f.target, tabs: { other } },
+    f.mapping,
+    "device",
+    async () => {},
+  );
+  expect(result.tabs[8]).toBe("other");
+  expect(f.remove).not.toHaveBeenCalled();
+});
+
+it("keeps a successful-but-ineffective Chromium remove pending", async () => {
+  const f = fixture(true);
+  f.remove.mockImplementationOnce(async () => {});
+  let saved = f.mapping;
+  await expect(
+    reconcile({ ...f.target, tabs: {} }, f.mapping, "device", async (mapping) => {
+      saved = mapping;
+    }),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+  expect(saved.tabs[7]).toBe("tab");
+  expect(saved.observed.tabs.tab).toBeDefined();
+  await reconcile({ ...f.target, tabs: {} }, saved, "device", async () => {});
+  expect(f.live()).toHaveLength(0);
+});
+
+it("never navigates a mapped tab that has become a protected local page", async () => {
+  const f = fixture(true);
+  f.setLive([{ ...f.live()[0]!, url: "chrome://settings" }]);
+  await expect(reconcile(f.target, f.mapping, "device", async () => {})).rejects.toBeInstanceOf(
+    BrowserRuntimeRaceError,
+  );
+  expect(f.update).not.toHaveBeenCalled();
+});

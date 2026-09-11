@@ -94,7 +94,7 @@ export async function capture(
   // committed event. Observe the settled event URL, never that racing pendingUrl.
   for (const tab of actual.flatMap((window) => window.tabs)) {
     const prior = mapping.observed.tabs[mapping.tabs[tab.local] ?? ""];
-    if (!prior) continue;
+    if (!prior || !syncableTab(tab.url, tab.incognito, ownOrigin())) continue;
     const event = evidence.navigations.get(tab.local);
     tab.url = event?.url ?? (prior.kind === "newtab" ? "about:blank" : prior.url);
   }
@@ -145,6 +145,7 @@ export async function capture(
         owned ||
         ownedCommits.has(local) ||
         (receipt &&
+          !receipt.superseded &&
           receipt.settledUrl === navigationKey(change) &&
           receipt.expectedUrl === navigationKey(canonical.tabs[change.id] ?? change))
       ) {
@@ -256,6 +257,7 @@ export async function reconcile(
       if (!first) continue;
       const existingFirst = localTabs.get(first.id);
       const reusableFirst = existingFirst !== undefined && actualTabs.has(existingFirst);
+      requireCurrent(first, "create");
       const created = await chrome.windows.create({
         focused: false,
         type: "normal",
@@ -320,10 +322,13 @@ export async function reconcile(
         // The initial browser snapshot may be hundreds of awaits old. Re-read the
         // tab and let the controller reject a plan superseded by local intent.
         live = await chrome.tabs.get(localTab);
+        if (!syncableTab(live.pendingUrl ?? live.url, live.incognito, ownOrigin()))
+          throw new BrowserRuntimeRaceError("The mapped tab became local-only.");
         requireCurrent(tab, "navigate");
         if (skipRemoteNavigation(next, tab, localTab, live.pendingUrl ?? live.url)) continue;
         expectNavigation(next, tab, localTab, live.pendingUrl ?? live.url, operationId);
         await persist(next);
+        requireCurrent(tab, "navigate");
         trace(
           "REMOTE",
           "TAB_NAVIGATE",
@@ -360,7 +365,19 @@ export async function reconcile(
       const candidates = refreshed
         .filter((window) => next.windows[String(window.local)] === previous.window)
         .flatMap((window) => window.tabs)
-        .filter((tab) => sameObservedTab(tab, previous));
+        .filter(
+          (tab) =>
+            (!next.tabs[tab.local] || next.tabs[tab.local] === logical) &&
+            sameObservedTab(tab, previous),
+        );
+      if (
+        !candidates.length &&
+        !refreshed.some((window) => window.tabs.some((tab) => tab.local === local))
+      ) {
+        if (!allowed()) throw new BrowserRuntimeRaceError();
+        delete next.tabs[localText];
+        continue; // Fresh topology confirms absence; never repeat a completed remove.
+      }
       if (candidates.length === 1) {
         local = candidates[0]!.local;
         liveTab = await currentTab(local);
@@ -370,7 +387,12 @@ export async function reconcile(
     const placeholder =
       liveTab?.url === `${ownOrigin()}/placeholder.html#${logical}` ||
       liveTab?.pendingUrl === `${ownOrigin()}/placeholder.html#${logical}`;
-    if (!liveTab || !previous || (!placeholder && !sameObservedTab(liveTab, previous))) {
+    if (
+      !liveTab ||
+      !previous ||
+      next.windows[liveTab.windowId] !== previous.window ||
+      (!placeholder && !sameObservedTab(liveTab, previous))
+    ) {
       trace(
         "REMOTE",
         "TAB_DELETE",

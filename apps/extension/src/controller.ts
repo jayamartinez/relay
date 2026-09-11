@@ -175,6 +175,7 @@ export class Controller {
   private loaded = false;
   private loadFailed = false;
   private persistedState?: string;
+  private persistence: Promise<void> = Promise.resolve();
   private storageWrites = 0;
   private serverRequests = 0;
   private lastTransientError = "NONE";
@@ -215,14 +216,20 @@ export class Controller {
     assert(root, "Workspace key is unavailable.");
     return unbase64(root);
   }
-  private async persist() {
+  private persist() {
     const state = JSON.stringify(this.require());
-    if (state === this.persistedState) return;
     // Snapshot before the first await; browser callbacks can update receipts while
     // encryption/storage is in flight. Never acknowledge data we did not save.
-    await vault.saveState(JSON.parse(state));
-    this.persistedState = state;
-    this.storageWrites++;
+    const write = this.persistence
+      .catch(() => {})
+      .then(async () => {
+        if (state === this.persistedState) return;
+        await vault.saveState(JSON.parse(state));
+        this.persistedState = state;
+        this.storageWrites++;
+      });
+    this.persistence = write;
+    return write;
   }
   private async persistSnapshotApplied() {
     const s = this.require();
@@ -388,6 +395,7 @@ export class Controller {
     this.events.clear();
     this.disconnect();
     this.network = "Offline";
+    this.statusChanged();
     await chrome.alarms.clear("relay-reconnect");
     if (this.local) await this.persist();
     trace("USER", "BROWSER_SHUTDOWN", "SUPPRESS");
@@ -501,10 +509,11 @@ export class Controller {
     if (this.local && remoteNavigationEvent(this.local.mapping, local, url, complete)) {
       // Still schedule one settled observation, never an immediate operation per callback.
       this.events.navigation(local, url, complete);
-      return;
+      return this.persist();
     }
     this.recordNavigationIntent(local, url);
     this.events.navigation(local, url, complete);
+    return this.local ? this.persist() : Promise.resolve();
   }
   navigationCommitted(local: number, url: string, transition: string, qualifiers: string[]) {
     if (
@@ -515,8 +524,20 @@ export class Controller {
       const logical = this.restoreCandidate?.tabs[local];
       if (logical) this.startupNavigations.add(logical);
     }
-    if (this.local) committedNavigation(this.local.mapping, local, url, transition, qualifiers);
+    if (this.local) {
+      const mapping = this.local.mapping;
+      const owned = committedNavigation(mapping, local, url, transition, qualifiers);
+      const id = mapping.tabs[local];
+      const intent = id ? mapping.freshness?.intents[id] : undefined;
+      // onUpdated may precede redirect metadata. Retire only that provisional
+      // observation, never a newer URL or a close, and never an already journaled edit.
+      if (owned && intent?.kind === "navigate" && !intent.journaled && intent.url === url)
+        delete mapping.freshness!.intents[id!];
+      if (!owned && !remoteNavigationEvent(mapping, local, url, false))
+        this.recordNavigationIntent(local, url);
+    }
     this.events.committed(local, url, transition, qualifiers);
+    return this.local ? this.persist() : Promise.resolve();
   }
   windowRemoved(local: number) {
     if ((this.remoteWindowCloses.get(local) ?? 0) > Date.now()) {
@@ -540,18 +561,27 @@ export class Controller {
     }
     this.recordDeleteIntent(local);
     this.events.removed(local, window, false);
+    return this.local ? this.persist() : Promise.resolve();
   }
   private recordNavigationIntent(local: number, url: string) {
     const s = this.local;
     const id = s?.mapping.tabs[local];
     const previous = id ? s.mapping.observed.tabs[id] : undefined;
     const navigation = syncableTab(url, false, ownOrigin());
+    const existing = id ? s?.mapping.freshness?.intents[id] : undefined;
+    if (s && id && previous && !navigation) {
+      this.recordDeleteIntent(local);
+      return;
+    }
     if (
       !s ||
       !id ||
       !previous ||
       !navigation ||
-      navigationKey(previous) === navigationKey(navigation)
+      existing?.kind === "delete" ||
+      (existing?.kind === "navigate"
+        ? this.localIntentNavigationKey(existing) === navigationKey(navigation)
+        : navigationKey(previous) === navigationKey(navigation))
     )
       return;
     const intent = recordLocalIntent(s.mapping, id, {
@@ -560,9 +590,6 @@ export class Controller {
       canonicalRevision: s.canonical.revision,
     });
     trace("USER", "TAB_NAVIGATE", "DETECTED", id, "", `intent:${intent.generation}`);
-    // Persist before the debounced capture/journal transaction so service-worker
-    // restart cannot resurrect an immediately closed or navigated tab from an old pull.
-    void this.persist().catch(() => {});
   }
   private recordDeleteIntent(local: number) {
     const s = this.local;
@@ -578,7 +605,6 @@ export class Controller {
       canonicalRevision: s.canonical.revision,
     });
     trace("USER", "TAB_DELETE", "DETECTED", id, "", `intent:${intent.generation}`);
-    void this.persist().catch(() => {});
   }
   async groupUpdated(local: number, collapsed: boolean) {
     if (this.local && updateCollapsedGroup(this.local.mapping, local, collapsed))
@@ -598,6 +624,7 @@ export class Controller {
     if (policy.disposition === "fatal") this.lastFatalError = policy.category;
     if (policy.category === "NETWORK") {
       this.network = "Offline";
+      this.statusChanged();
       this.disconnect();
       this.scheduleReconnect();
     } else if (policy.disposition === "transient") {
@@ -1282,6 +1309,8 @@ export class Controller {
         continue;
       }
       const intentKey = this.localIntentNavigationKey(intent);
+      const local = Object.entries(s.mapping.tabs).find(([, logical]) => logical === id)?.[0];
+      if (local !== undefined && this.events.pending.navigations.has(Number(local))) continue;
       if (!intent.url || !intentKey || (canonical && navigationKey(canonical) === intentKey))
         continue;
       const tab = syncableTab(intent.url, false, ownOrigin());
@@ -1314,6 +1343,8 @@ export class Controller {
       });
     }
     await this.enqueue(changes, "STARTUP");
+    this.settleLocalIntents();
+    await this.persist();
   }
   private hasPendingIntentChange(
     id: string,
@@ -1336,6 +1367,7 @@ export class Controller {
   async captureLocal() {
     const s = this.local;
     if (!s || s.phase !== "active" || this.halted || this.lifecycle !== "LIVE") return false;
+    await this.persistence;
     requireGroupSupport(s.canonical);
     const evidence = this.events.take();
     if (!evidence) return false;
@@ -1358,6 +1390,8 @@ export class Controller {
     // by the device-local preference must be forgotten, otherwise reconciliation would
     // see the canonical create as missing and build a duplicate.
     if (!this.preferences.tabCreation) this.forgetUnsyncedCreations(result.mapping, result.changes);
+    result.mapping.freshness = structuredClone(s.mapping.freshness);
+    result.mapping.navigation = structuredClone(s.mapping.navigation);
     s.mapping = result.mapping;
     if (navigationCircuit(result.changes, s.mapping)) {
       s.paused = true;
@@ -1415,6 +1449,10 @@ export class Controller {
           // Browser callbacks are not serialized with this reconciliation. Keep any
           // newer direct user intent when reconcile persists an older mapping clone.
           mapping.freshness = structuredClone(s.mapping.freshness);
+          for (const [id, receipt] of Object.entries(s.mapping.navigation ?? {})) {
+            if (mapping.navigation?.[id]?.operationId === receipt.operationId)
+              mapping.navigation[id] = structuredClone(receipt);
+          }
           s.mapping = mapping;
           await this.persist();
         },
@@ -1733,11 +1771,12 @@ export class Controller {
       ),
     );
     for (const [id, intent] of Object.entries(intents)) {
-      if (!intent.journaled) continue;
+      const local = Object.entries(s.mapping.tabs).find(([, logical]) => logical === id)?.[0];
+      if (local !== undefined && this.events.pending.navigations.has(Number(local))) continue;
       if (pending.has(id)) continue;
       const canonical = s.canonical.tabs[id];
-      // A signed pull acknowledging our sequence makes the canonical outcome
-      // deterministic. It may be our local value or a later concurrent winner.
+      // Retire only canonical satisfaction with no pending tab work. This also
+      // handles A/B/A returning to the canonical URL without requiring a no-op journal.
       if (
         intent.kind === "delete"
           ? !canonical
@@ -1907,6 +1946,7 @@ export class Controller {
     void chrome.alarms.create("relay-reconnect", { when: Date.now() + Math.max(30_000, delay) });
   }
   wake: () => void = () => {};
+  statusChanged: () => void = () => {};
   onSocketMessage: (data: string) => void = () => {};
   async connect() {
     const s = this.local;
@@ -1941,6 +1981,7 @@ export class Controller {
     socket.onopen = () => {
       if (this.socket !== socket) return;
       this.network = "Live";
+      this.statusChanged();
       this.socketOpenedAt = Date.now();
       this.socketStartedAt = 0;
       this.lastSocketMessage = Date.now();
@@ -1950,6 +1991,7 @@ export class Controller {
         if (Date.now() - this.lastSocketMessage > 75_000) {
           this.disconnect();
           this.network = "Offline";
+          this.statusChanged();
           this.scheduleReconnect();
           return;
         }
@@ -1959,6 +2001,7 @@ export class Controller {
           } catch {
             this.disconnect();
             this.network = "Offline";
+            this.statusChanged();
             this.scheduleReconnect();
           }
         }
@@ -1976,6 +2019,7 @@ export class Controller {
       if (this.socket === socket) {
         this.disconnect();
         this.network = "Offline";
+        this.statusChanged();
         this.scheduleReconnect();
       }
     };
@@ -1983,6 +2027,7 @@ export class Controller {
       if (this.socket !== socket) return;
       this.disconnect();
       this.network = "Offline";
+      this.statusChanged();
       this.scheduleReconnect();
     };
     // Handlers must exist before yielding to a storage write: open/close can fire
@@ -2034,6 +2079,7 @@ export class Controller {
     if (this.socket) {
       this.disconnect();
       this.network = "Offline";
+      this.statusChanged();
     }
     await this.connect();
   }
