@@ -10,4 +10,4 @@ Before publishing a public service/repository, the maintainer must configure a p
 
 For this local development copy, report privately to the project owner. Do not post account numbers, recovery material, browser profile archives, decrypted URLs, private keys, or exploit details in a public issue. A useful report includes affected commit/version, a minimal reproduction using synthetic data, impact, and proposed mitigation.
 
-The source and protocol are public. Security depends on standard primitives and verified trust boundaries, not obscurity. Read [the exact cryptographic model](docs/CRYPTOGRAPHY.md), [threat model](docs/THREAT-MODEL.md), and [remaining release gates](docs/VALIDATION.md).
+The source and protocol are public. Security depends on standard primitives and verified trust boundaries, not obscurity. Read [the exact cryptographic model](docs/CRYPTOGRAPHY.md), [threat model](docs/THREAT-MODEL.md), and [remaining release gates](docs/THREAT-MODEL.md#release-gates).

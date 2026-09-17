@@ -59,6 +59,17 @@ const json = (value: unknown, status = 200) =>
     headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
   });
 const jsonBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+const recoveryAction = (action: string) => action === "recover-join" || action === "recover-chain";
+const errorResponse = (error: unknown) =>
+  json(
+    {
+      error:
+        error instanceof HttpError
+          ? { code: error.code, message: error.message }
+          : { code: "REQUEST_VALIDATION_FAILED", message: "Request validation failed." },
+    },
+    error instanceof HttpError ? error.status : 400,
+  );
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -173,8 +184,32 @@ export class RelayAccount extends DurableObject<Env> {
       try {
         ws.send("changed");
       } catch {
-        ws.close(1011, "Reconnect");
+        this.closeSocket(ws, 1011, "Reconnect");
       }
+    }
+  }
+  private closeSocket(ws: WebSocket, code: number, reason: string) {
+    try {
+      ws.close(code, reason);
+    } catch {
+      // Transport teardown cannot undo a committed membership or workspace write.
+    }
+  }
+  private notifyRevoked(ws: WebSocket, generation: number) {
+    try {
+      let after = -1;
+      while (after < generation) {
+        const page = this.controlPage(after, generation);
+        assert(page.nextGeneration > after, "Missing revocation history.");
+        // Each existing-format frame is bounded. Clients verify the signed
+        // chain incrementally and erase only after their removal is verified.
+        ws.send(JSON.stringify({ type: "revoked", chain: page.chain }));
+        after = page.nextGeneration;
+      }
+    } catch {
+      // Remote wipe is best effort; authorization was already revoked in SQL.
+    } finally {
+      this.closeSocket(ws, 4003, "Revoked");
     }
   }
   private async authenticate(
@@ -199,7 +234,7 @@ export class RelayAccount extends DurableObject<Env> {
     );
     const meta = this.meta();
     const key =
-      c.device === "recovery" && purpose === "recover-join"
+      c.device === "recovery" && recoveryAction(purpose)
         ? meta.control.recovery.auth
         : meta.control.members.find((d) => d.id === c.device)?.auth;
     if (!key) fail(403, "Device is not authorized.");
@@ -235,15 +270,14 @@ export class RelayAccount extends DurableObject<Env> {
     );
   }
   async fetch(request: Request): Promise<Response> {
-    return this.ctx.blockConcurrencyWhile(async () => {
-      try {
-        this.ctx.storage.sql.exec("DELETE FROM transient WHERE expires <= ?", Date.now());
-        const url = new URL(request.url);
-        const parts = url.pathname.split("/");
-        const account = parts[2];
-        const action = parts[3];
-        assert(account && action);
-        if (action === "socket") return this.socket(url, request);
+    try {
+      const url = new URL(request.url);
+      const parts = url.pathname.split("/");
+      const account = parts[2];
+      const action = parts[3];
+      assert(account && action);
+      let input: Record<string, unknown> = {};
+      if (action !== "socket") {
         if (request.method !== "POST") return json({ error: "POST required" }, 405);
         const length = Number(request.headers.get("Content-Length") ?? "0");
         if (length > LIMITS.message) fail(413, "Request too large.");
@@ -268,22 +302,25 @@ export class RelayAccount extends DurableObject<Env> {
           bodyBytes.set(chunk, offset);
           offset += chunk.length;
         }
-        const input = record(JSON.parse(new TextDecoder().decode(bodyBytes)));
-        const payload = record(input.payload ?? {});
-        this.budget("all", 1200);
-        return await this.dispatch(account, action, payload, input.proof);
-      } catch (error) {
-        return json(
-          {
-            error:
-              error instanceof HttpError
-                ? { code: error.code, message: error.message }
-                : { code: "REQUEST_VALIDATION_FAILED", message: "Request validation failed." },
-          },
-          error instanceof HttpError ? error.status : 400,
-        );
+        input = record(JSON.parse(new TextDecoder().decode(bodyBytes)));
       }
-    });
+      const payload = record(input.payload ?? {});
+      // An unfinished upload must not hold the account's concurrency gate. All
+      // state reads, one-use authentication and writes remain serialized below.
+      return await this.ctx.blockConcurrencyWhile(async () => {
+        try {
+          this.ctx.storage.sql.exec("DELETE FROM transient WHERE expires <= ?", Date.now());
+          if (action === "socket") return this.socket(url, request);
+          this.budget("all", 1200);
+          return await this.dispatch(account, action, payload, input.proof);
+        } catch (error) {
+          // Expected validation failures must not escape and reset the object.
+          return errorResponse(error);
+        }
+      });
+    } catch (error) {
+      return errorResponse(error);
+    }
   }
   private async dispatch(
     account: string,
@@ -322,7 +359,7 @@ export class RelayAccount extends DurableObject<Env> {
       const purpose = text(p.purpose, 40);
       if (
         !meta.control.members.some((d) => d.id === device) &&
-        !(device === "recovery" && purpose === "recover-join")
+        !(device === "recovery" && recoveryAction(purpose))
       )
         fail(403, "Device is not authorized.");
       const issued = Date.now();
@@ -342,7 +379,11 @@ export class RelayAccount extends DurableObject<Env> {
     if (action === "recover-info") {
       this.budget("recovery", 6);
       const m = this.meta();
-      return json({ recovery: m.control.recovery, chain: this.chain(-1) });
+      const page = this.controlPage(-1, m.control.generation, m.control.recovery);
+      if (p.pagination === true) return json(page);
+      if (page.more)
+        fail(409, "Update Relay to recover this account.", "RECOVERY_PAGINATION_REQUIRED");
+      return json({ recovery: m.control.recovery, chain: page.chain });
     }
     if (action === "pair-start") {
       this.budget("enrollment", 5);
@@ -427,10 +468,18 @@ export class RelayAccount extends DurableObject<Env> {
     }
     const actor = await this.authenticate(account, action, p, proof);
     const meta = this.meta();
+    if (action === "recover-chain") {
+      if (actor !== "recovery") fail(403, "Recovery authorization is required.");
+      const generation = integer(p.generation, -1);
+      if (generation > meta.control.generation)
+        fail(409, "Recovery continuation is ahead of the server.");
+      return json(this.controlPage(generation, meta.control.generation));
+    }
     if (action === "sync") {
       const since = integer(p.since);
-      const generation = Number(p.generation);
-      assert(Number.isInteger(generation) && generation >= -1);
+      const generation = integer(p.generation, -1);
+      if (generation > meta.control.generation)
+        fail(409, "Sync membership continuation is ahead of the server.");
       if (since > meta.revision) fail(409, "Sync continuation is ahead of the server.");
       const pagination = p.pagination === true;
       const responseBudget = this.syncResponseBudget();
@@ -627,10 +676,8 @@ export class RelayAccount extends DurableObject<Env> {
         }
       });
       for (const device of revoked)
-        for (const ws of this.ctx.getWebSockets(device.id)) {
-          ws.send(JSON.stringify({ type: "revoked", chain: this.chain(-1) }));
-          ws.close(4003, "Revoked");
-        }
+        for (const ws of this.ctx.getWebSockets(device.id))
+          this.notifyRevoked(ws, control.generation);
       this.broadcast();
       return json({ ok: true });
     }
@@ -640,19 +687,15 @@ export class RelayAccount extends DurableObject<Env> {
     const r = record(raw);
     return { ephemeral: text(r.ephemeral, 256), random: text(r.random, 64) };
   }
-  private chain(after: number): Control[] {
-    return this.ctx.storage.sql
-      .exec<{ value: string }>(
-        "SELECT value FROM controls WHERE generation > ? ORDER BY generation",
-        after,
-      )
-      .toArray()
-      .map((row) => JSON.parse(row.value) as Control);
-  }
-  private controlPage(fromGeneration: number, currentGeneration: number) {
+  private controlPage(
+    fromGeneration: number,
+    currentGeneration: number,
+    recovery?: Control["recovery"],
+  ) {
     const responseBudget = this.syncResponseBudget();
     const base = {
       kind: "control" as const,
+      ...(recovery ? { recovery } : {}),
       chain: [],
       fromGeneration,
       nextGeneration: Number.MAX_SAFE_INTEGER,
@@ -684,7 +727,7 @@ export class RelayAccount extends DurableObject<Env> {
     }
     const nextGeneration = chain.at(-1)?.generation ?? fromGeneration;
     const more = nextGeneration < currentGeneration;
-    const page = { kind: "control" as const, chain, fromGeneration, nextGeneration, more };
+    const page = { ...base, chain, nextGeneration, more };
     if (jsonBytes(page) > responseBudget)
       fail(413, "Sync control response exceeds the response budget.", "SYNC_RESPONSE_TOO_LARGE");
     return page;
@@ -696,7 +739,7 @@ export class RelayAccount extends DurableObject<Env> {
     this.removeTemporary(`ticket:${ticket}`);
     if (!device || !this.meta().control.members.some((d) => d.id === device))
       fail(403, "Device is not authorized.");
-    for (const old of this.ctx.getWebSockets(device)) old.close(1000, "Replaced");
+    for (const old of this.ctx.getWebSockets(device)) this.closeSocket(old, 1000, "Replaced");
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1], [device]);
     pair[1].serializeAttachment({ device });
@@ -705,15 +748,15 @@ export class RelayAccount extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
   webSocketMessage(ws: WebSocket, _message: string | ArrayBuffer) {
-    ws.close(1008, "Only heartbeat messages are accepted.");
+    this.closeSocket(ws, 1008, "Only heartbeat messages are accepted.");
   }
   webSocketClose(ws: WebSocket, code: number, reason: string) {
     const attachment = ws.deserializeAttachment() as { device?: string } | null;
     if (attachment?.device) this.put(`seen:${attachment.device}`, Date.now());
-    ws.close([1005, 1006, 1015].includes(code) ? 1000 : code, reason);
+    this.closeSocket(ws, [1005, 1006, 1015].includes(code) ? 1000 : code, reason);
     this.broadcast();
   }
   webSocketError(ws: WebSocket) {
-    ws.close(1011, "Reconnect");
+    this.closeSocket(ws, 1011, "Reconnect");
   }
 }

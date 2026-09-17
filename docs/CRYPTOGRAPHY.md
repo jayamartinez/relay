@@ -17,7 +17,7 @@ Cryptographic JSON is UTF-8 with recursively sorted object keys (lexicographic c
 | Device agreement pair | Separate P-256 ECDH; non-extractable private CryptoKey in IndexedDB | Root-key provisioning |
 | Local vault key | Non-extractable AES-256-GCM CryptoKey in IndexedDB | Encrypt account state, root, journal and mapping |
 | Recovery secret R | 32 random bytes, shown during setup only | Encrypt recovery private-key package |
-| Recovery signing pair | Separate P-256 ECDSA | Recovery enrollment authorization |
+| Recovery signing pair | Separate P-256 ECDSA | Recovery history continuation and enrollment authorization |
 | Recovery agreement pair | Separate P-256 ECDH | Recover current root, including after rotation |
 | Pairing ephemerals | New P-256 ECDH pair and random 32-byte commitment nonce per participant/request | SAS authenticated exchange |
 
@@ -52,11 +52,11 @@ The SAS is the first unsigned big-endian 32 bits of the HKDF SAS output modulo 1
 
 The server does not store a shared recovery-auth bearer secret or a value from which an encryption key can be derived. Instead it stores a recovery **public signing key**, public agreement key and the encrypted private-key package. R never leaves the client. Possession of R decrypts the private package locally and enables a signed recovery challenge response.
 
-At creation and every rotation, the WRK is also wrapped to the recovery public agreement key. A recovered client verifies the complete membership chain, unwraps the current recovery root box, and signs a one-device membership addition with the recovery signing key. This supports recovery after revocation without requiring authorized devices to retain R. Losing R and all authorized devices loses access. Recovery-secret replacement/reissue is not implemented.
+At creation and every rotation, the WRK is also wrapped to the recovery public agreement key. A recovered client verifies the complete membership chain, unwraps the current recovery root box, and signs a one-device membership addition with the recovery signing key. Long histories are retrieved in bounded pages; continuation requests use signed, payload-bound recovery challenges, and every transition is checked against the preceding verified record and immutable recovery identity. The secret-decrypted recovery identity remains the verification anchor. This supports recovery after revocation without requiring authorized devices to retain R. Losing R and all authorized devices loses access. Recovery-secret replacement/reissue is not implemented.
 
 ## Pairing and membership
 
-Both sides commit to SHA-256(canonical `{ephemeral,random}`) before either learns the other's reveal. Each pins the first counterpart commitment. The transcript contains protocol/account, unique request ID, exact expiry, both identities/public keys, both commitments and both reveals. Replacing identity or agreement keys changes the SAS; changing a reveal without its precommitted hash is rejected. Users must compare codes on both screens. Never approve an unexpected request.
+Both sides commit to SHA-256(canonical `{ephemeral,random}`) before either learns the other's reveal. Each persists the first counterpart commitment before sending its own reveal. The requester validates both read and reveal replies against the pinned context, including previously accepted reveals. The transcript contains protocol/account, unique request ID, exact expiry, both identities/public keys, both commitments and both reveals. Replacing identity or agreement keys changes the SAS; changing a reveal without its precommitted hash is rejected. The confirmation UI submits the displayed code and requires fresh consent after pairing state changes. Users must compare codes on both screens. Never approve an unexpected request.
 
 Genesis is self-signed by its sole creator. Every later control record signs the previous record's hash, monotonically increasing generation, epoch, actor, member public keys, stable recovery record and per-recipient root boxes. An existing member or the recovery signing identity may authorize additions. Removing exactly one member requires a new epoch and reprovisioning; retained public keys cannot silently change. Enrollment cannot replace existing root boxes. The receiver trusts the approved counterpart via SAS and pins that signed membership head. Recovery anchors verification using the secret-decrypted recovery identity and the complete signature chain.
 
@@ -64,7 +64,7 @@ All current members are account administrators in v1. Membership is not a multi-
 
 ## Revocation and limitations
 
-Revocation generates an independent WRK and encrypts a current snapshot under the new epoch. Only retained member public agreement keys and the recovery public agreement key receive boxes. The server atomically commits membership/snapshot/log pruning and rejects the removed device's future challenges. Other clients verify the signed chain before accepting new keys. An online removed client verifies the removal chain, clears its vault/Relay storage and disconnects; it does not close browser tabs.
+Revocation generates an independent WRK and encrypts a current snapshot under the new epoch. Only retained member public agreement keys and the recovery public agreement key receive boxes. The server atomically commits membership/snapshot/log pruning and rejects the removed device's future challenges. Other clients verify the signed chain before accepting new keys. An online removed client verifies the removal chain across bounded notification frames, clears its vault/Relay storage after earlier saves have settled, and disconnects; it does not close browser tabs. Notification and teardown are best effort and cannot reverse a committed server-side removal.
 
 Old root boxes in signed history remain ciphertext under their original recipient keys. Revocation cannot erase historic data or keys already observed. It is not forward secrecy against later endpoint compromise. A recovery-secret holder remains an authorization authority until a future explicitly implemented recovery replacement mechanism exists.
 

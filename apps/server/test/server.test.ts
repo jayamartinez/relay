@@ -2,13 +2,16 @@ import { env } from "cloudflare:workers";
 import {
   checkControl,
   controlHash,
+  derive,
   encryptEnvelope,
   ephemeral,
   hash,
   identity,
   makeControl,
+  open,
   randomKey,
   recoverIdentity,
+  seal,
   sign,
   wrapRoot,
 } from "@relay/crypto";
@@ -17,6 +20,7 @@ import {
   type Control,
   controlBody,
   parseOperation,
+  type Recovery,
   type SyncReply,
 } from "@relay/protocol";
 import {
@@ -25,11 +29,11 @@ import {
   SYNC_CLIENT_RESPONSE_BYTE_LIMIT,
   SYNC_RESPONSE_BYTE_BUDGET,
 } from "@relay/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { fixture } from "../../../tests/fixtures";
 
-async function client() {
-  const f = await fixture();
+async function client(setup?: Awaited<ReturnType<typeof fixture>>) {
+  const f = setup ?? (await fixture());
   const stub = env.ACCOUNTS.get(env.ACCOUNTS.idFromName(f.handle));
   const post = (action: string, payload: unknown, proof?: unknown) =>
     stub.fetch(`http://relay/v1/${f.handle}/${action}`, {
@@ -228,6 +232,31 @@ describe("SQLite Durable Object", () => {
       (await f.post("challenge", { device: "unknown", purpose: "sync", digest: "x" })).status,
     ).toBe(403);
   });
+  it("rejects malformed and future membership cursors before returning workspace state", async () => {
+    const f = await client();
+    for (const generation of ["0", null, true, -2, 0.5, Number.MAX_SAFE_INTEGER + 1])
+      expect((await f.auth("sync", { since: 0, generation, pagination: true })).status).toBe(400);
+    expect((await f.auth("sync", { since: 0, generation: 1, pagination: true })).status).toBe(409);
+    expect((await f.auth("sync", { since: 0, generation: -1, pagination: true })).status).toBe(200);
+  });
+  it("rejects a streamed oversized request without altering account state", async () => {
+    const f = await client();
+    const response = await f.stub.fetch(`http://relay/v1/${f.handle}/checkpoint`, {
+      method: "POST",
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(LIMITS.message + 1));
+          controller.close();
+        },
+      }),
+    });
+    expect(response.status).toBe(413);
+    const sync = await (
+      await f.auth("sync", { since: 0, generation: 0, force: true })
+    ).json<SyncReply>();
+    expect(sync.snapshot).toEqual(f.snapshot);
+    expect(sync.revision).toBe(0);
+  });
   it("consumes challenges once and binds payload digest and purpose", async () => {
     const f = await client();
     const payload = { since: 0, generation: 0, force: true };
@@ -241,6 +270,56 @@ describe("SQLite Durable Object", () => {
     const proof = { challenge, signature: await sign(f.device.signing, challenge) };
     expect((await f.post("sync", payload, proof)).status).toBe(200);
     expect((await f.post("sync", payload, proof)).status).toBe(400);
+    const freshProof = async () => {
+      const challenge = await (
+        await f.post("challenge", {
+          device: f.device.device.id,
+          purpose: "sync",
+          digest: await hash(canonical(payload)),
+        })
+      ).json<Challenge>();
+      return { challenge, signature: await sign(f.device.signing, challenge) };
+    };
+    const invalid = await freshProof();
+    expect((await f.post("sync", payload, { ...invalid, signature: "invalid" })).status).toBe(403);
+    expect((await f.post("sync", payload, invalid)).status).toBe(400);
+    const changed = await freshProof();
+    expect((await f.post("sync", { ...payload, force: false }, changed)).status).toBe(400);
+    expect((await f.post("sync", payload, changed)).status).toBe(400);
+    expect((await f.post("socket-ticket", payload, await freshProof())).status).toBe(400);
+    const racing = await freshProof();
+    const results = await Promise.all([
+      f.post("sync", payload, racing),
+      f.post("sync", payload, racing),
+    ]);
+    expect(results.map((response) => response.status).sort()).toEqual([200, 400]);
+  });
+  it("serves authenticated sync while another request body is unfinished", async () => {
+    const f = await client();
+    const { readable, writable } = new TransformStream<Uint8Array>();
+    const writer = writable.getWriter();
+    const slow = f.stub.fetch(`http://relay/v1/${f.handle}/challenge`, {
+      method: "POST",
+      body: readable,
+    });
+    await writer.write(new TextEncoder().encode('{"payload":'));
+    const fast = f.auth("sync", { since: 0, generation: 0 });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const status = await Promise.race([
+        fast.then((response) => response.status),
+        new Promise<number>((resolve) => {
+          timer = setTimeout(() => resolve(-1), 500);
+        }),
+      ]);
+      expect(status).toBe(200);
+    } finally {
+      clearTimeout(timer);
+      await writer.write(new TextEncoder().encode("{}}"));
+      await writer.close();
+      await slow;
+      await fast;
+    }
   });
   it("orders encrypted operations, deduplicates and checkpoints for an offline client", async () => {
     const f = await client();
@@ -418,15 +497,41 @@ describe("SQLite Durable Object", () => {
       { ...f.snapshot.header, epoch: 2 },
       f.workspace,
     );
-    expect((await f.auth("rotate", { control: rotated, snapshot })).status).toBe(200);
-
     const controlBytes = Math.max(
       new TextEncoder().encode(JSON.stringify(added)).byteLength,
       new TextEncoder().encode(JSON.stringify(rotated)).byteLength,
     );
+    const { ticket } = await (
+      await f.auth("socket-ticket", {}, joining.device.id, joining.signing)
+    ).json<{ ticket: string }>();
+    const opened = await f.stub.fetch(`http://relay/v1/${f.handle}/socket?ticket=${ticket}`, {
+      headers: { Upgrade: "websocket" },
+    });
+    expect(opened.status).toBe(101);
+    const socket = opened.webSocket!;
+    socket.accept();
+    const revokedFrames: string[] = [];
+    socket.addEventListener("message", (event) => {
+      if (typeof event.data === "string" && event.data.startsWith('{"type":"revoked"'))
+        revokedFrames.push(event.data);
+    });
+    const closed = new Promise<void>((resolve) =>
+      socket.addEventListener("close", () => resolve(), { once: true }),
+    );
     const testEnv = env as unknown as { SYNC_RESPONSE_BYTE_BUDGET?: string };
     testEnv.SYNC_RESPONSE_BYTE_BUDGET = String(controlBytes + 400);
     try {
+      expect((await f.auth("rotate", { control: rotated, snapshot })).status).toBe(200);
+      await closed;
+      expect(revokedFrames).toHaveLength(3);
+      expect(
+        revokedFrames.every(
+          (frame) => new TextEncoder().encode(frame).byteLength <= controlBytes + 400,
+        ),
+      ).toBe(true);
+      expect(
+        revokedFrames.flatMap((frame) => (JSON.parse(frame) as { chain: Control[] }).chain),
+      ).toEqual([f.control, added, rotated]);
       expect((await f.auth("sync", { since: 0, generation: 0 })).status).toBe(409);
       const firstResponse = await f.auth("sync", { since: 0, generation: 0, pagination: true });
       const firstBytes = await responseBytes(firstResponse);
@@ -462,9 +567,144 @@ describe("SQLite Durable Object", () => {
       expect(workspace.kind).toBe("workspace");
       expect(workspace.generation).toBe(2);
       expect(workspace.snapshot?.header.epoch).toBe(2);
+
+      const recoveryBytes = new TextEncoder().encode(JSON.stringify(f.control.recovery)).byteLength;
+      const recoveryBudget = controlBytes + recoveryBytes + 300;
+      testEnv.SYNC_RESPONSE_BYTE_BUDGET = String(recoveryBudget);
+      const legacyRecovery = await f.post("recover-info", {});
+      expect(legacyRecovery.status).toBe(409);
+      expect((await legacyRecovery.json()).error.code).toBe("RECOVERY_PAGINATION_REQUIRED");
+      const recoveryResponse = await f.post("recover-info", { pagination: true });
+      expect(recoveryResponse.status).toBe(200);
+      expect(await responseBytes(recoveryResponse)).toBeLessThanOrEqual(recoveryBudget);
+      const recoveryPage = await recoveryResponse.json<SyncReply & { recovery: Recovery }>();
+      expect(recoveryPage.recovery).toEqual(f.control.recovery);
+      expect(recoveryPage.kind).toBe("control");
+      expect(recoveryPage.fromGeneration).toBe(-1);
+      expect(recoveryPage.nextGeneration).toBe(0);
+      expect(recoveryPage.more).toBe(true);
+      let verified: Control | undefined;
+      for (const control of recoveryPage.chain) {
+        await checkControl(control, verified);
+        verified = control;
+      }
+      let more = recoveryPage.more;
+      while (more) {
+        const response = await f.auth(
+          "recover-chain",
+          { generation: verified!.generation },
+          "recovery",
+          recovery.signing,
+        );
+        expect(response.status).toBe(200);
+        expect(await responseBytes(response)).toBeLessThanOrEqual(recoveryBudget);
+        const page = await response.json<SyncReply>();
+        expect(page.fromGeneration).toBe(verified!.generation);
+        expect(page.chain.length).toBeGreaterThan(0);
+        for (const control of page.chain) {
+          await checkControl(control, verified);
+          verified = control;
+        }
+        expect(page.nextGeneration).toBe(verified!.generation);
+        more = page.more;
+      }
+      expect(verified).toEqual(rotated);
+      expect((await f.post("recover-chain", { generation: 0 })).status).toBe(400);
+      expect((await f.auth("recover-chain", { generation: 0 })).status).toBe(403);
+      expect(
+        (await f.auth("recover-chain", { generation: 0 }, "recovery", f.device.signing)).status,
+      ).toBe(403);
+      for (let index = 0; index < 4; index++)
+        expect((await f.post("recover-info", { pagination: true })).status).toBe(200);
+      expect((await f.post("recover-info", { pagination: true })).status).toBe(429);
+      for (let index = 0; index < 8; index++)
+        expect(
+          (await f.auth("recover-chain", { generation: 1 }, "recovery", recovery.signing)).status,
+        ).toBe(200);
+      expect(
+        (await f.auth("recover-chain", { generation: 3 }, "recovery", recovery.signing)).status,
+      ).toBe(409);
     } finally {
       delete testEnv.SYNC_RESPONSE_BYTE_BUDGET;
+      socket.close();
     }
+  });
+  it("recovers a valid signed history larger than the client transport limit", async () => {
+    const setup = await fixture();
+    const wrapping = await derive(setup.secret, setup.handle, "relay/recovery-wrap/v1");
+    const aad = { version: 1, account: setup.handle, type: "recovery-identity" };
+    const recoveryPackage = await open<Record<string, unknown>>(
+      wrapping,
+      setup.control.recovery.blob,
+      aad,
+    );
+    // Extra encrypted metadata remains opaque to the server. The package still
+    // recovers its real keys, and every signed request is below the 2 MB limit.
+    const recovery = {
+      ...setup.control.recovery,
+      blob: await seal(wrapping, { ...recoveryPackage, padding: "x".repeat(900_000) }, aad),
+    };
+    setup.control = await makeControl(
+      { ...controlBody(setup.control), recovery },
+      setup.device.signing,
+    );
+    const f = await client(setup);
+    const keys = await recoverIdentity(f.secret, f.handle, recovery);
+    const history = [f.control];
+    let current = f.control;
+    for (let generation = 1; generation <= 6; generation++) {
+      const device = (await identity()).device;
+      current = await makeControl(
+        {
+          ...controlBody(current),
+          generation,
+          previous: await controlHash(current),
+          actor: "recovery",
+          members: [...current.members, device],
+          boxes: {
+            ...current.boxes,
+            [device.id]: await wrapRoot(f.root, device.exchange, f.handle, 1, device.id),
+          },
+        },
+        keys.signing,
+      );
+      expect(
+        (await f.auth("recover-join", { control: current }, "recovery", keys.signing)).status,
+      ).toBe(200);
+      history.push(current);
+    }
+    const legacyBytes = new TextEncoder().encode(
+      JSON.stringify({ recovery, chain: history }),
+    ).byteLength;
+    expect(legacyBytes).toBeGreaterThan(SYNC_CLIENT_RESPONSE_BYTE_LIMIT);
+    expect((await f.post("recover-info", {})).status).toBe(409);
+    let response = await f.post("recover-info", { pagination: true });
+    let verified: Control | undefined;
+    let pages = 0;
+    while (true) {
+      expect(response.status).toBe(200);
+      expect(await responseBytes(response)).toBeLessThanOrEqual(SYNC_RESPONSE_BYTE_BUDGET);
+      const page = await response.json<SyncReply>();
+      expect(page.fromGeneration).toBe(verified?.generation ?? -1);
+      expect(page.chain.length).toBeGreaterThan(0);
+      for (const control of page.chain) {
+        await checkControl(control, verified);
+        verified = control;
+      }
+      expect(page.nextGeneration).toBe(verified!.generation);
+      pages++;
+      if (!page.more) break;
+      expect(pages).toBeLessThan(LIMITS.control);
+      response = await f.auth(
+        "recover-chain",
+        { generation: verified!.generation },
+        "recovery",
+        keys.signing,
+      );
+    }
+    expect(pages).toBeGreaterThan(1);
+    expect(verified!.generation).toBe(6);
+    expect(await controlHash(verified!)).toBe(await controlHash(current));
   });
   it("recovers authorization, rotates keys, and rejects revoked signers", async () => {
     const f = await client();
@@ -519,7 +759,30 @@ describe("SQLite Durable Object", () => {
       { ...f.snapshot.header, epoch: 2 },
       f.workspace,
     );
-    expect((await f.auth("rotate", { control: rotated, snapshot })).status).toBe(200);
+    const { ticket } = await (await f.auth("socket-ticket", {}, b.device.id, b.signing)).json<{
+      ticket: string;
+    }>();
+    const opened = await f.stub.fetch(`http://relay/v1/${f.handle}/socket?ticket=${ticket}`, {
+      headers: { Upgrade: "websocket" },
+    });
+    expect(opened.status).toBe(101);
+    opened.webSocket!.accept();
+    const originalSend = WebSocket.prototype.send;
+    const send = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function (
+      this: WebSocket,
+      data,
+    ) {
+      if (typeof data === "string" && data.includes('"type":"revoked"'))
+        throw new Error("Synthetic disconnected socket");
+      return originalSend.call(this, data);
+    });
+    try {
+      expect((await f.auth("rotate", { control: rotated, snapshot })).status).toBe(200);
+      expect(send).toHaveBeenCalled();
+    } finally {
+      send.mockRestore();
+      opened.webSocket!.close();
+    }
     expect((await f.auth("sync", { since: 0, generation: 1 }, b.device.id, b.signing)).status).toBe(
       403,
     );

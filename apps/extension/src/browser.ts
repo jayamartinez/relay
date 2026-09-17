@@ -22,7 +22,7 @@ import {
   suppress,
   targetUrl,
 } from "./browser-model";
-import { BrowserRuntimeRaceError } from "./browser-runtime";
+import { BrowserRuntimeRaceError, type ReconcileGuardContext } from "./browser-runtime";
 import { trace } from "./diagnostics";
 import { groupsAvailable, reconcileGroups, requireGroupSupport } from "./group-browser";
 import {
@@ -181,7 +181,7 @@ export async function reconcile(
   mapping: Mapping,
   source: string,
   persist: (mapping: Mapping) => Promise<void>,
-  allowed: (tab?: LogicalTab, mutation?: "create" | "navigate") => boolean = () => true,
+  allowed: (context?: ReconcileGuardContext) => boolean = () => true,
   traceDetail: (tab?: LogicalTab) => string = () => `rev:${target.revision}`,
 ): Promise<Mapping> {
   target = browserWorkspace(replicatedWorkspace(target));
@@ -189,7 +189,7 @@ export async function reconcile(
   const next = structuredClone(mapping);
   const operationId = crypto.randomUUID();
   const requireCurrent = (tab: LogicalTab, mutation: "create" | "navigate") => {
-    if (allowed(tab, mutation)) return;
+    if (allowed({ boundary: "mutation_boundary", logicalId: tab.id, mutation })) return;
     trace(
       "RECONCILE",
       mutation === "create" ? "TAB_CREATE" : "TAB_NAVIGATE",
@@ -206,7 +206,12 @@ export async function reconcile(
   // Intent is durable before calling Chrome. A terminated worker can replay this target.
   await persist(next);
   const actual = await browserWindows();
-  if (!actual.length || !allowed()) throw new BrowserRuntimeRaceError();
+  if (!actual.length)
+    throw new BrowserRuntimeRaceError(undefined, {
+      reason: "initial_snapshot_invalid",
+      boundary: "initial_snapshot",
+    });
+  if (!allowed({ boundary: "initial_snapshot" })) throw new BrowserRuntimeRaceError();
   const current = observe(actual, next, await sessionId(), source, ownOrigin());
   if (diffWorkspace(current.workspace, target).length === 0) {
     await persist(current.mapping);
@@ -248,7 +253,8 @@ export async function reconcile(
     }
   };
   for (const window of Object.values(target.windows).sort((a, b) => a.order - b.order)) {
-    if (!allowed()) throw new BrowserRuntimeRaceError();
+    if (!allowed({ boundary: "window_boundary", logicalId: window.id }))
+      throw new BrowserRuntimeRaceError();
     const desired = tabsIn(target, window.id);
     if (!desired.length) continue;
     let local = localWindows.get(window.id);
@@ -287,7 +293,8 @@ export async function reconcile(
       await persist(next);
     }
     for (const tab of desired) {
-      if (!allowed()) throw new BrowserRuntimeRaceError();
+      if (!allowed({ boundary: "tab_boundary", logicalId: tab.id }))
+        throw new BrowserRuntimeRaceError();
       let localTab = localTabs.get(tab.id);
       let live = localTab === undefined ? undefined : await chrome.tabs.get(localTab);
       if (!live) {
@@ -352,7 +359,8 @@ export async function reconcile(
     }
   }
   for (const [localText, logical] of Object.entries(next.tabs)) {
-    if (!allowed()) throw new BrowserRuntimeRaceError();
+    if (!allowed({ boundary: "destructive_boundary", logicalId: logical }))
+      throw new BrowserRuntimeRaceError();
     if (target.tabs[logical]) continue;
     let local = Number(localText);
     const previous = mapping.observed.tabs[logical];
@@ -374,7 +382,8 @@ export async function reconcile(
         !candidates.length &&
         !refreshed.some((window) => window.tabs.some((tab) => tab.local === local))
       ) {
-        if (!allowed()) throw new BrowserRuntimeRaceError();
+        if (!allowed({ boundary: "destructive_boundary", logicalId: logical }))
+          throw new BrowserRuntimeRaceError();
         delete next.tabs[localText];
         continue; // Fresh topology confirms absence; never repeat a completed remove.
       }
@@ -383,7 +392,8 @@ export async function reconcile(
         liveTab = await currentTab(local);
       }
     }
-    if (!allowed()) throw new BrowserRuntimeRaceError();
+    if (!allowed({ boundary: "destructive_boundary", logicalId: logical }))
+      throw new BrowserRuntimeRaceError();
     const placeholder =
       liveTab?.url === `${ownOrigin()}/placeholder.html#${logical}` ||
       liveTab?.pendingUrl === `${ownOrigin()}/placeholder.html#${logical}`;

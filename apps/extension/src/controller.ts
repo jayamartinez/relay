@@ -80,8 +80,8 @@ import {
   navigationKey,
   recordLocalIntent,
 } from "./browser-model";
-import { asBrowserRuntimeRace } from "./browser-runtime";
-import { diagnosticDevice, diagnosticSnapshot, trace } from "./diagnostics";
+import { asBrowserRuntimeRace, type ReconcileGuardContext } from "./browser-runtime";
+import { browserRace, diagnosticDevice, diagnosticSnapshot, trace } from "./diagnostics";
 import { type FailureDisposition, failurePolicy } from "./failure-policy";
 import { groupsAvailable, groupsEnabled, requireGroupSupport } from "./group-browser";
 import { pruneCollapsedGroups, updateCollapsedGroup } from "./group-model";
@@ -94,6 +94,7 @@ import {
 } from "./preferences";
 import { RemoteChangeTracker } from "./remote-change-tracker";
 import { settleBrowserRestore } from "./restore-settling";
+import { SerialTaskQueue } from "./serial-task-queue";
 import { reconnectDelay, SOCKET_STABLE_MS, socketNeedsReconnect } from "./socket-lifecycle";
 import * as vault from "./vault";
 import { initialMerge, restoreMapping } from "./workspace-lifecycle";
@@ -175,11 +176,13 @@ export class Controller {
   private loaded = false;
   private loadFailed = false;
   private persistedState?: string;
-  private persistence: Promise<void> = Promise.resolve();
+  private readonly persistence = new SerialTaskQueue();
+  private wiping = false;
   private storageWrites = 0;
   private serverRequests = 0;
   private lastTransientError = "NONE";
   private lastFatalError = "NONE";
+  private blockingNavigationIntentId?: string;
   pendingTasks: () => number = () => 0;
   get browserWorkPending() {
     return this.lifecycle === "LIVE" && !this.halted && this.events.readyAt > 0;
@@ -216,20 +219,22 @@ export class Controller {
     assert(root, "Workspace key is unavailable.");
     return unbase64(root);
   }
-  private persist() {
+  private async persist() {
+    if (this.wiping) return;
     const state = JSON.stringify(this.require());
     // Snapshot before the first await; browser callbacks can update receipts while
     // encryption/storage is in flight. Never acknowledge data we did not save.
-    const write = this.persistence
-      .catch(() => {})
-      .then(async () => {
+    await this.persistence.run(
+      async () => {
+        // Browser callbacks can save outside the controller queue. Serialize the
+        // entire encryption/write and compare only after preceding saves settle.
         if (state === this.persistedState) return;
         await vault.saveState(JSON.parse(state));
         this.persistedState = state;
         this.storageWrites++;
-      });
-    this.persistence = write;
-    return write;
+      },
+      () => {},
+    );
   }
   private async persistSnapshotApplied() {
     const s = this.require();
@@ -864,6 +869,23 @@ export class Controller {
     assert(key, "Pairing keys are unavailable. Start pairing again.");
     return (await pairing(key, role, this.transcript(pair))).sas;
   }
+  private checkedPair(raw: unknown, pinned: PairRequest): PairRequest {
+    const pair = parsePair(raw);
+    assert(canonical(pairStart(pair)) === canonical(pairStart(pinned)), "Pairing request changed.");
+    if (pinned.offer)
+      assert(canonical(pair.offer) === canonical(pinned.offer), "Pairing offer changed.");
+    for (const field of ["requesterReveal", "approverReveal", "control"] as const)
+      if (pinned[field])
+        assert(canonical(pair[field]) === canonical(pinned[field]), "Pairing response changed.");
+    if (pair.requesterReveal)
+      assert(
+        canonical(pair.requesterReveal) === canonical(this.require().pairSecrets[pair.id]?.reveal),
+        "Pairing requester reveal changed.",
+      );
+    if (pinned.status !== "pending")
+      assert(pair.status === pinned.status, "Pairing result changed.");
+    return pair;
+  }
   async pollPair() {
     const s = this.require();
     if (s.phase !== "pending" || !s.request) return;
@@ -876,22 +898,19 @@ export class Controller {
       nonce: crypto.randomUUID(),
       expires: Date.now() + 25_000,
     };
-    const pair = parsePair(
+    const pair = this.checkedPair(
       await this.api().post<unknown>("pair-read", {
         ...payload,
         signature: await sign(this.key(), payload),
       }),
+      s.request,
     );
-    assert(
-      canonical(pairStart(pair)) === canonical(pairStart(s.request)),
-      "Pairing request changed.",
-    );
-    if (s.request.offer)
-      assert(canonical(pair.offer) === canonical(s.request.offer), "Pairing offer changed.");
     s.request = pair;
     if (pair.offer && !pair.requesterReveal && pair.status === "pending") {
       const reveal = s.pairSecrets[pair.id]?.reveal;
       assert(reveal);
+      // Revealing must not outlive the pinned counterpart after worker termination.
+      await this.persist();
       const signed = {
         version: 1,
         account: s.handle,
@@ -901,10 +920,13 @@ export class Controller {
         expires: Date.now() + 25_000,
         reveal,
       };
-      s.request = await this.api().post<PairRequest>("pair-reveal", {
-        ...signed,
-        signature: await sign(this.key(), signed),
-      });
+      s.request = this.checkedPair(
+        await this.api().post<unknown>("pair-reveal", {
+          ...signed,
+          signature: await sign(this.key(), signed),
+        }),
+        pair,
+      );
     }
     await this.persist();
   }
@@ -999,7 +1021,12 @@ export class Controller {
   async refreshApprovals() {
     const s = this.local;
     try {
-      if (s?.phase === "active" && s.control && Date.now() - this.lastApprovalRefresh > 1_000)
+      if (
+        s?.phase === "active" &&
+        !s.paused &&
+        s.control &&
+        Date.now() - this.lastApprovalRefresh > 1_000
+      )
         await this.pull();
       else await this.pruneExpiredApprovals();
     } catch (error) {
@@ -1086,20 +1113,51 @@ export class Controller {
     );
     this.halted = false;
     this.error = "";
-    const info = await this.api().post<{ recovery: Recovery; chain: Control[] }>(
-      "recover-info",
-      {},
-    );
+    const info = await this.api().post<{ recovery: Recovery; chain: Control[] }>("recover-info", {
+      pagination: true,
+    });
     const keys = await recoverIdentity(parseRecovery(code), s.handle, info.recovery);
-    assert(
-      Array.isArray(info.chain) && info.chain.length > 0 && info.chain.length <= LIMITS.control,
-    );
     let previous: Control | undefined;
-    for (const raw of info.chain) {
-      const c = parseControl(raw);
-      assert(c.account === s.handle && canonical(c.recovery) === canonical(info.recovery));
-      await checkControl(c, previous);
-      previous = c;
+    let page = record(info);
+    let controls = 0;
+    while (true) {
+      const chain = page.chain;
+      const paginated = page.kind === "control";
+      const from = previous?.generation ?? -1;
+      assert(
+        Array.isArray(chain) && chain.length > 0 && controls + chain.length <= LIMITS.control,
+        "Invalid recovery history page.",
+      );
+      if (paginated)
+        assert(
+          page.fromGeneration === from && typeof page.more === "boolean",
+          "Invalid recovery continuation.",
+        );
+      else assert(!previous && page.kind === undefined, "Invalid recovery response.");
+      for (const raw of chain) {
+        const control = parseControl(raw);
+        assert(
+          control.account === s.handle && canonical(control.recovery) === canonical(info.recovery),
+        );
+        await checkControl(control, previous);
+        previous = control;
+      }
+      controls += chain.length;
+      assert(previous);
+      if (!paginated) break; // Compatible complete reply from an older v1 server.
+      assert(
+        page.nextGeneration === previous.generation && previous.generation > from,
+        "Invalid recovery continuation range.",
+      );
+      if (!page.more) break;
+      page = record(
+        await this.api().authenticated<unknown>(
+          "recover-chain",
+          { generation: previous.generation },
+          "recovery",
+          keys.signing,
+        ),
+      );
     }
     assert(previous);
     s.control = previous;
@@ -1456,17 +1514,53 @@ export class Controller {
           s.mapping = mapping;
           await this.persist();
         },
-        (tab, mutation) => {
-          if (this.events.closing || planGeneration !== this.reconcileGeneration) return false;
+        (context?: ReconcileGuardContext) => {
           const freshness = s.mapping.freshness;
-          if ((freshness?.generation ?? 0) !== intentGeneration) return false;
-          if (!tab) return true;
-          const intent = freshness?.intents[tab.id];
-          if (!intent) return true;
-          if (intent.kind === "delete") return false;
-          return (
-            mutation !== "navigate" || navigationKey(tab) === this.localIntentNavigationKey(intent)
-          );
+          const currentFreshness = freshness?.generation ?? 0;
+          const intent = context?.logicalId ? freshness?.intents[context.logicalId] : undefined;
+          const common = {
+            boundary: context?.boundary ?? "unspecified",
+            plan: planGeneration,
+            capturedFreshness: intentGeneration,
+            currentFreshness,
+            mutation: context?.mutation,
+            intentKind: intent?.kind,
+            intentGeneration: intent?.generation,
+            revision: target.revision,
+            lifecycle: this.lifecycle,
+            persistedIntent: !!s.intent,
+            logicalId: context?.logicalId,
+            browserWindows: Object.keys(s.mapping.windows).length,
+            browserTabs: Object.keys(s.mapping.tabs).length,
+            browserGroups: Object.keys(s.mapping.groups ?? {}).length,
+          } as const;
+          if (this.events.closing) {
+            browserRace({ ...common, reason: "browser_closing" });
+            return false;
+          }
+          if (planGeneration !== this.reconcileGeneration) {
+            browserRace({ ...common, reason: "superseded_plan" });
+            return false;
+          }
+          if (currentFreshness !== intentGeneration) {
+            browserRace({ ...common, reason: "freshness_generation_changed" });
+            return false;
+          }
+          if (!context?.logicalId || !intent) return true;
+          if (intent.kind === "delete") {
+            browserRace({ ...common, reason: "local_delete_blocks_mutation" });
+            return false;
+          }
+          const tab = target.tabs[context.logicalId];
+          if (
+            context.mutation === "navigate" &&
+            (!tab || navigationKey(tab) !== this.localIntentNavigationKey(intent))
+          ) {
+            this.blockingNavigationIntentId = context.logicalId;
+            browserRace({ ...common, reason: "local_navigation_blocks_remote_navigation" });
+            return false;
+          }
+          return true;
         },
         (tab) => {
           const intent = tab ? s.mapping.freshness?.intents[tab.id] : undefined;
@@ -1475,7 +1569,23 @@ export class Controller {
       );
     } catch (error) {
       if (this.events.closing) return; // Keep durable intent; the close transaction decides next.
-      throw asBrowserRuntimeRace(error) ?? error;
+      const race = asBrowserRuntimeRace(error);
+      if (race?.reason)
+        browserRace({
+          reason: race.reason,
+          boundary: race.boundary ?? "unknown",
+          plan: planGeneration,
+          capturedFreshness: intentGeneration,
+          currentFreshness: s.mapping.freshness?.generation ?? 0,
+          revision: target.revision,
+          lifecycle: this.lifecycle,
+          persistedIntent: !!s.intent,
+          browserId: race.browserId,
+          browserWindows: Object.keys(s.mapping.windows).length,
+          browserTabs: Object.keys(s.mapping.tabs).length,
+          browserGroups: Object.keys(s.mapping.groups ?? {}).length,
+        });
+      throw race ?? error;
     } finally {
       this.lifecycle = previousLifecycle;
     }
@@ -1532,14 +1642,14 @@ export class Controller {
         force: forceSnapshot,
         pagination: true,
       });
-      forceSnapshot = false;
       if (reply.kind === "control") {
         if (++controlPages > SYNC_MAX_CONTROL_PAGES_PER_PULL)
           throw new Error("Sync control catch-up exceeded the safe page limit. Relay will retry.");
-        forceSnapshot =
-          (await this.applyControlPage(reply, s.control.generation)) || !!s.snapshotRequired;
+        const epochChanged = await this.applyControlPage(reply, s.control.generation);
+        forceSnapshot = forceSnapshot || epochChanged || !!s.snapshotRequired;
         continue;
       }
+      forceSnapshot = false;
       if (reply.kind === "workspace") {
         const currentControl = s.control;
         assert(currentControl);
@@ -1710,8 +1820,17 @@ export class Controller {
       sequence === (canonicalState.sequences[s.device.id] ?? 0),
       "Unverified journal acknowledgment rejected.",
     );
+    const acknowledgedIntentIds = new Set(
+      s.queue
+        .filter((entry) => entry.sequence <= sequence)
+        .flatMap((entry) =>
+          entry.operation.changes.flatMap((change) =>
+            change.type === "tab-create" ? [change.tab.id] : "id" in change ? [change.id] : [],
+          ),
+        ),
+    );
     s.queue = s.queue.filter((q) => q.sequence > sequence);
-    this.settleLocalIntents();
+    this.settleLocalIntents(acknowledgedIntentIds);
     this.pruneLocalGroupState();
     s.nextSequence = Math.max(s.nextSequence, sequence + 1);
     s.approvals = pending.map(parsePair);
@@ -1759,7 +1878,7 @@ export class Controller {
     this.error = "";
     return "complete";
   }
-  private settleLocalIntents() {
+  private settleLocalIntents(acknowledged = new Set<string>()) {
     const s = this.require();
     const intents = s.mapping.freshness?.intents;
     if (!intents) return;
@@ -1775,15 +1894,65 @@ export class Controller {
       if (local !== undefined && this.events.pending.navigations.has(Number(local))) continue;
       if (pending.has(id)) continue;
       const canonical = s.canonical.tabs[id];
-      // Retire only canonical satisfaction with no pending tab work. This also
-      // handles A/B/A returning to the canonical URL without requiring a no-op journal.
+      // Once this exact intent's operation is acknowledged, its canonical outcome
+      // is deterministic even when a newer peer edit won. Missing queue state alone
+      // is not acknowledgement: legacy durable intent must still be repaired.
       if (
-        intent.kind === "delete"
+        acknowledged.has(id) ||
+        (intent.kind === "delete"
           ? !canonical
-          : !!canonical && navigationKey(canonical) === this.localIntentNavigationKey(intent)
+          : !!canonical && navigationKey(canonical) === this.localIntentNavigationKey(intent))
       )
         delete intents[id];
     }
+  }
+  private blockingNavigationIntentAudit(projected: Workspace) {
+    if (!__DEV__) return;
+    const s = this.local;
+    const id = this.blockingNavigationIntentId;
+    if (!s || !id) return;
+    const intent = s.mapping.freshness?.intents[id];
+    if (!intent) return;
+    const references = s.queue.flatMap(({ sequence, operation }) =>
+      operation.changes.flatMap((change) => {
+        const changeId =
+          change.type === "tab-create" ? change.tab.id : "id" in change ? change.id : undefined;
+        if (changeId !== id) return [];
+        return [
+          {
+            kind: change.type,
+            sequence,
+            base: operation.base,
+            targetMatchesIntent:
+              change.type === "tab-navigate" && intent.kind === "navigate"
+                ? navigationKey(change) === this.localIntentNavigationKey(intent)
+                : undefined,
+          },
+        ];
+      }),
+    );
+    const sameNavigation = (tab: Workspace["tabs"][string] | undefined) =>
+      intent.kind === "navigate"
+        ? !!tab && navigationKey(tab) === this.localIntentNavigationKey(intent)
+        : undefined;
+    const acknowledged = s.canonical.sequences[s.device.id] ?? 0;
+    return {
+      logicalId: id.slice(-6),
+      kind: intent.kind,
+      generation: intent.generation,
+      journaled: !!intent.journaled,
+      queue: references,
+      acknowledgedSequence: acknowledged,
+      queueAcknowledged: references.map((reference) => reference.sequence <= acknowledged),
+      pushState: "not-tracked",
+      canonicalMatchesIntent: sameNavigation(s.canonical.tabs[id]),
+      projectedMatchesIntent: sameNavigation(projected.tabs[id]),
+      canonicalMatchesQueuedTarget: references.map((reference) =>
+        reference.kind === "tab-navigate"
+          ? sameNavigation(s.canonical.tabs[id]) === reference.targetMatchesIntent
+          : undefined,
+      ),
+    };
   }
   async flush(recovering = false) {
     const s = this.local;
@@ -2061,14 +2230,24 @@ export class Controller {
   }
   private async wipeRevoked() {
     this.disconnect();
-    await vault.wipe();
-    await chrome.storage.local.clear();
-    await chrome.storage.session.clear();
-    await chrome.alarms.clearAll();
-    this.local = undefined;
-    this.signing = undefined;
-    this.exchange = undefined;
-    this.halted = true;
+    this.wiping = true;
+    try {
+      // An earlier browser callback must not restore state after the wipe commits.
+      await this.persistence.run(
+        () => vault.wipe(),
+        () => {},
+      );
+      this.persistedState = undefined;
+      this.local = undefined;
+      this.signing = undefined;
+      this.exchange = undefined;
+      this.halted = true;
+      await chrome.storage.local.clear();
+      await chrome.storage.session.clear();
+      await chrome.alarms.clearAll();
+    } finally {
+      this.wiping = false;
+    }
   }
   async watchdog() {
     if (this.reconnectAt > Date.now()) return;
@@ -2205,6 +2384,9 @@ export class Controller {
             remoteDirty: this.remoteChanges.dirty,
             lastErrorCategory: this.lastErrorCategory,
             lastErrorDisposition: this.lastErrorDisposition,
+            blockingNavigationIntent: projected
+              ? this.blockingNavigationIntentAudit(projected)
+              : undefined,
           }
         : undefined,
       behavior: diagnosticSnapshot(),

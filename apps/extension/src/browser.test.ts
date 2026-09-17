@@ -211,7 +211,7 @@ it("does not recreate a tab when a user close supersedes a stale reconcile plan"
         // fresh delete intent before Chrome is allowed to create the missing tab.
         closed = true;
       },
-      (tab) => !(closed && tab?.id === "tab"),
+      (context) => !(closed && context?.logicalId === "tab"),
     ),
   ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
   expect(f.create).not.toHaveBeenCalled();
@@ -230,7 +230,7 @@ it("does not restore an older URL when a user navigation supersedes its reconcil
         // construction and the awaited tabs.get/tabs.update boundary.
         navigated = true;
       },
-      (tab, mutation) => !(navigated && tab?.id === "tab" && mutation === "navigate"),
+      (context) => !(navigated && context?.logicalId === "tab" && context.mutation === "navigate"),
     ),
   ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
   expect(f.update).not.toHaveBeenCalled();
@@ -254,7 +254,45 @@ it("does not restore an old URL while a discarded tab is waking into a user navi
       f.mapping,
       "device",
       async () => {},
-      (tab, mutation) => !(tab?.id === "tab" && mutation === "navigate"),
+      (context) => !(context?.logicalId === "tab" && context.mutation === "navigate"),
+    ),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+  expect(f.update).not.toHaveBeenCalled();
+});
+
+it("checks the first tab's delete intent before creating its missing window", async () => {
+  const f = fixture(false);
+  f.mapping.windows = {};
+  chrome.windows.create = vi.fn(async () => ({
+    id: 2,
+    tabs: [
+      { id: 8, windowId: 2, index: 0, pinned: false, incognito: false, url: f.target.tabs.tab.url },
+    ],
+  })) as unknown as typeof chrome.windows.create;
+  await expect(
+    reconcile(
+      f.target,
+      f.mapping,
+      "device",
+      async () => {},
+      (context) => context?.logicalId !== "tab",
+    ),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+  expect(chrome.windows.create).not.toHaveBeenCalled();
+});
+
+it("rechecks a user navigation received while its remote receipt was being saved", async () => {
+  const f = fixture(true);
+  let navigated = false;
+  await expect(
+    reconcile(
+      { ...f.target, tabs: { tab: { ...f.target.tabs.tab, url: "https://example.com/old" } } },
+      f.mapping,
+      "device",
+      async (mapping) => {
+        if (mapping.navigation?.tab) navigated = true;
+      },
+      (context) => !(navigated && context?.logicalId === "tab" && context.mutation === "navigate"),
     ),
   ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
   expect(f.update).not.toHaveBeenCalled();

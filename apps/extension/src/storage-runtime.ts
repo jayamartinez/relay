@@ -5,5 +5,5 @@ export class StorageInterruptedError extends Error {
   }
 }
 export function storageError(error: DOMException | null) {
-  return error?.name === "AbortError" ? new StorageInterruptedError(error) : error;
+  return error === null || error.name === "AbortError" ? new StorageInterruptedError(error) : error;
 }
