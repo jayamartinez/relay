@@ -4,6 +4,12 @@
 
 Relay is an open-source browser extension and Cloudflare backend that keeps tabs, windows, and supported tab groups synchronized across Chromium-based browsers without giving the sync service access to your browsing workspace.
 
+## Download and install
+
+[Download the latest Relay release](https://github.com/jayamartinez/relay/releases/latest).
+
+Relay releases are distributed as unpacked Chromium extensions. To install, download and extract the ZIP, open `helium://extensions` or `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select the extracted folder containing `manifest.json`.
+
 ## Demo
 
 Account creation, device setup, and live synchronization in action:
@@ -160,7 +166,7 @@ pnpm install
 pnpm dev
 ```
 
-Then load `apps/extension/dist` as an unpacked extension in two separate Chromium browser profiles.
+Then load `apps/extension/dist` as an unpacked development extension in two separate Chromium browser profiles.
 
 During onboarding, choose:
 
