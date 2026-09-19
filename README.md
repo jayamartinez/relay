@@ -2,6 +2,33 @@
 
 Relay is an open-source browser extension and Cloudflare Worker for synchronizing tabs, windows, and supported tab groups across Chromium-based browsers.
 
+## Preview
+
+<p align="center">
+  <a href="docs/assets/relay-preview.mp4">
+    <img src="docs/assets/relay-settings.png" alt="Relay settings showing a live synchronized workspace" width="900">
+  </a>
+</p>
+
+<p align="center">
+  <a href="docs/assets/relay-preview.mp4"><strong>Watch the two-device synchronization demo</strong></a>
+</p>
+
+<table>
+  <tr>
+    <td width="72%">
+      <img src="docs/assets/relay-onboarding.png" alt="Relay account creation screen">
+    </td>
+    <td width="28%">
+      <img src="docs/assets/relay-popup.png" alt="Relay popup showing a live workspace with two connected devices">
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Private, passwordless onboarding</strong></td>
+    <td align="center"><strong>Sync status at a glance</strong></td>
+  </tr>
+</table>
+
 ## Why Relay exists
 
 Browser sync is usually tied to a vendor account and often exposes more browsing data than a self-hosted tool should. Relay keeps the synchronized workspace encrypted on the client, uses a small coordination service to move ciphertext between authorized devices, and continues recording local changes while a device is offline.
