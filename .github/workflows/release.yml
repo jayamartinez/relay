@@ -1,0 +1,81 @@
+name: Release Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and Release Extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      ARCHIVE_NAME: relay-extension-${{ github.ref_name }}.zip
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.20.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.12.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate release version
+        run: pnpm check:release-version "$RELEASE_TAG"
+
+      - name: Run quality checks
+        run: |
+          pnpm lint
+          pnpm typecheck
+          pnpm test
+
+      - name: Build production extension
+        run: pnpm build:extension:production
+
+      - name: Package extension
+        run: |
+          test -f apps/extension/dist/manifest.json
+          mkdir -p release
+          (cd apps/extension/dist && zip -q -r "../../../release/$ARCHIVE_NAME" . -x '*.map' '*.env*')
+          unzip -l "release/$ARCHIVE_NAME"
+          unzip -Z1 "release/$ARCHIVE_NAME" | grep -Fx 'manifest.json'
+          if unzip -Z1 "release/$ARCHIVE_NAME" | grep -E '(^|/)(node_modules|\.env|.*\.map$)' ; then
+            echo 'Release archive contains forbidden files.'
+            exit 1
+          fi
+          sha256sum "release/$ARCHIVE_NAME" > "release/$ARCHIVE_NAME.sha256"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > release-notes.md <<'EOF'
+          Relay is experimental pre-release software. It is independent from and not endorsed by Helium, and it has not been security audited or published to the Chrome Web Store.
+
+          Installation: download the ZIP, extract it, open helium://extensions or chrome://extensions, enable Developer mode, choose Load unpacked, and select the extracted folder.
+          EOF
+          gh release create "$RELEASE_TAG" \
+            "release/$ARCHIVE_NAME" \
+            "release/$ARCHIVE_NAME.sha256" \
+            --title "Relay $RELEASE_TAG" \
+            --prerelease \
+            --generate-notes \
+            --notes-file release-notes.md
