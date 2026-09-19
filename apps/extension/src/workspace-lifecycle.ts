@@ -28,6 +28,7 @@ export function restoreMapping(
   seed.windows = {};
   seed.tabs = {};
   seed.ignoredWindows = [];
+  seed.adoptableWindows = [];
   // Match against both the last local observation and current canonical state. A restored
   // old URL can still identify a tab whose canonical destination changed while offline.
   seed.observed = structuredClone(target);
@@ -207,6 +208,9 @@ export function initialMerge(
     }
   }
   const result = observe(actual, seed, session, source, origin);
+  result.mapping.adoptableWindows = actual
+    .filter((window) => !result.mapping.windows[window.local] && !localTabs(window, origin).length)
+    .map((window) => window.local);
   const changes = diffWorkspace(emptyWorkspace(), result.workspace).filter(
     (c) => c.type !== "window-create" || !canonicalState.windows[c.id],
   );

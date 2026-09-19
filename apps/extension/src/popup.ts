@@ -13,6 +13,7 @@ const app = document.getElementById("app");
 const requests = new SingleFlight();
 let state: Status;
 let selectedId: string | undefined;
+let localError: string | undefined;
 let localAction: "approve" | "deny" | undefined;
 let resultTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -39,7 +40,16 @@ function approvalHeader(label = "Needs attention") {
   return el("header", "popup-header", brand(), statusBadge(label));
 }
 
+function settingsControl() {
+  return button(
+    "Settings →",
+    () => void chrome.runtime.openOptionsPage().catch(showError),
+    "ghost compact",
+  );
+}
+
 function navigate(offset: -1 | 1) {
+  localError = undefined;
   const request = currentApproval(state.approvals, selectedId);
   if (!request) return;
   selectedId = adjacentApprovalId(state.approvals, request.id, offset);
@@ -83,13 +93,17 @@ function resultView() {
               "div",
               "popup-approval-actions",
               button(
-                "Retry",
-                () => void runApproval(activity.action, activity.requestId),
+                activity.action === "approve" ? "Review again" : "Retry",
+                () =>
+                  void (activity.action === "approve"
+                    ? dismissResult()
+                    : runApproval(activity.action, activity.requestId)),
                 "primary compact",
               ),
             ),
           ]
         : []),
+      button("Back", () => void dismissResult(), "ghost compact"),
     );
   }
   const approved = activity.status === "approved";
@@ -132,6 +146,28 @@ function pendingView() {
     ),
     el("p", "popup-request-meta", `Requested ${ago(request.requestedAt).toLowerCase()}`),
   );
+  if (state.paused) {
+    section.append(
+      el(
+        "p",
+        "popup-approval-copy popup-preparing",
+        "Relay is paused. Resume to review this device request.",
+      ),
+      button(
+        "Resume Relay",
+        () => {
+          localError = undefined;
+          void requests
+            .run("pause", () => call("pause", { value: false }))
+            .then(update)
+            .then(prepareCurrentRequest)
+            .catch(showError);
+        },
+        "secondary compact",
+      ),
+    );
+    return section;
+  }
   if (request.sas) {
     section.append(
       el("div", "eyebrow popup-code-label", "Verification code"),
@@ -178,19 +214,33 @@ function pendingView() {
 }
 
 function render() {
-  if (!app || !state) return;
-  const actionResult = resultView();
-  if (state.error && state.approvalActivity?.status !== "failed") {
-    app.replaceChildren(approvalHeader(state.status), errorMessage(state.error), footer());
+  if (!app) return;
+  clearTimeout(resultTimer);
+  if (!state) {
+    app.replaceChildren(
+      approvalHeader("Not connected"),
+      errorMessage(localError ?? "Relay background worker is unavailable."),
+      el(
+        "nav",
+        "popup-actions",
+        button("Retry", () => void load(), "secondary compact"),
+        settingsControl(),
+      ),
+      footer(),
+    );
     return;
   }
+  const actionResult = resultView();
+  const failure =
+    state.approvalActivity?.status === "failed" ? undefined : localError || state.error;
   const approval = actionResult ?? pendingView();
+  app.replaceChildren(approvalHeader(approval || failure ? "Needs attention" : state.status));
+  if (failure) app.append(errorMessage(failure));
   if (approval) {
-    app.replaceChildren(approvalHeader(), approval, footer());
+    app.append(approval, settingsControl(), footer());
     scheduleResultDismissal();
     return;
   }
-  app.replaceChildren(approvalHeader(state.status));
   if (state.phase !== "active") {
     app.append(
       el("h2", "popup-title", "Your workspace, everywhere."),
@@ -223,7 +273,7 @@ function render() {
           () => void call("pause", { value: !state.paused }).then(update).catch(showError),
           "secondary compact",
         ),
-        button("Settings →", () => void chrome.runtime.openOptionsPage(), "ghost compact"),
+        settingsControl(),
       ),
       el(
         "div",
@@ -250,6 +300,7 @@ async function runApproval(action: "approve" | "deny", requestId: string) {
   if (!request || (action === "approve" && !request.sas)) return;
   const key = `${action}:${requestId}`;
   if (requests.has(key)) return;
+  localError = undefined;
   localAction = action;
   render();
   try {
@@ -261,8 +312,9 @@ async function runApproval(action: "approve" | "deny", requestId: string) {
     try {
       update(await call("status"));
     } catch {
-      showError(error);
+      // Preserve the original action error if the status read also fails.
     }
+    showError(error);
   } finally {
     localAction = undefined;
     render();
@@ -270,6 +322,7 @@ async function runApproval(action: "approve" | "deny", requestId: string) {
 }
 
 async function prepareCurrentRequest() {
+  if (state.paused || state.approvalActivity || localAction) return;
   const request = currentApproval(state.approvals, selectedId);
   if (!request || request.reviewing) return;
   const key = `review:${request.id}`;
@@ -280,10 +333,21 @@ async function prepareCurrentRequest() {
   }
 }
 
+async function dismissResult() {
+  localError = undefined;
+  selectedId = state.approvalActivity?.requestId;
+  try {
+    update(await requests.run("dismiss-result", () => call("dismiss-approval-result")));
+    await prepareCurrentRequest();
+  } catch (error) {
+    showError(error);
+  }
+}
+
 function scheduleResultDismissal() {
   clearTimeout(resultTimer);
   const activity = state.approvalActivity;
-  if (!activity?.finishedAt || activity.status === "failed") return;
+  if (!activity?.finishedAt || activity.status === "failed" || localError) return;
   const remaining = Math.max(0, activity.finishedAt + 2_500 - Date.now());
   resultTimer = setTimeout(() => {
     void call("dismiss-approval-result").then(update).then(prepareCurrentRequest).catch(showError);
@@ -291,18 +355,25 @@ function scheduleResultDismissal() {
 }
 
 function showError(error: unknown) {
-  if (!app) return;
-  app.querySelector(".popup-error")?.remove();
-  app.append(
-    errorMessage(error instanceof Error ? error.message : "Relay is unavailable."),
-    ...(app.querySelector(".footer") ? [] : [footer()]),
-  );
+  localError = error instanceof Error ? error.message : "Relay is unavailable.";
+  render();
 }
 
 async function reconcile() {
+  if (state.paused) return;
   try {
     update(await call("refresh-approvals"));
     await prepareCurrentRequest();
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function load() {
+  localError = undefined;
+  try {
+    update(await requests.run("status", () => call("status")));
+    await reconcile();
   } catch (error) {
     showError(error);
   }
@@ -312,4 +383,4 @@ watchStatus(() => {
   if (!document.hidden)
     void call("status").then(update).then(prepareCurrentRequest).catch(showError);
 });
-void call("status").then(update).then(reconcile).catch(showError);
+void load();

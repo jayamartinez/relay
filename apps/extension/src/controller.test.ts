@@ -2,9 +2,11 @@ import {
   base64,
   controlHash,
   encryptEnvelope,
+  ephemeral,
   identity,
   makeControl,
   randomKey,
+  recoveryCode,
   wrapRoot,
 } from "@relay/crypto";
 import {
@@ -12,11 +14,12 @@ import {
   type Envelope,
   emptyWorkspace,
   type Operation,
+  type PairRequest,
   type SyncReply,
 } from "@relay/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixture } from "../../../tests/fixtures";
-import { ApiError } from "./api";
+import { Api, ApiError } from "./api";
 import { browserWindows, capture, reconcile, sessionId } from "./browser";
 import { BrowserRuntimeRaceError } from "./browser-runtime";
 import { Controller } from "./controller";
@@ -30,6 +33,7 @@ vi.mock("./vault", () => ({
   loadState: vi.fn(),
   read: vi.fn(),
   remove: vi.fn(),
+  wipe: vi.fn(async () => {}),
 }));
 vi.mock("./browser", () => ({
   browserWindows: vi.fn(),
@@ -206,13 +210,19 @@ beforeEach(() => {
   vi.mocked(vault.saveState).mockResolvedValue();
   vi.mocked(vault.loadState).mockResolvedValue(undefined);
   vi.mocked(vault.read).mockResolvedValue(undefined);
+  vi.mocked(vault.wipe).mockResolvedValue();
   Socket.all = [];
   vi.stubGlobal("WebSocket", Socket);
   vi.stubGlobal("__DEV__", true);
+  vi.stubGlobal("__BUILD_CHANNEL__", "development");
+  vi.stubGlobal("__OFFICIAL_ORIGIN__", "");
   vi.stubGlobal("chrome", {
-    alarms: { create: vi.fn(async () => {}), clear: vi.fn(async () => {}) },
+    alarms: { create: vi.fn(async () => {}), clear: vi.fn(async () => {}), clearAll: vi.fn() },
     action: { setBadgeText: vi.fn(), setBadgeBackgroundColor: vi.fn() },
-    storage: { local: { get: async () => ({}), set: vi.fn() } },
+    storage: {
+      local: { get: async () => ({}), set: vi.fn(), clear: vi.fn() },
+      session: { clear: vi.fn() },
+    },
   });
 });
 afterEach(() => {
@@ -1041,6 +1051,95 @@ it("skips identical durable state writes but retries a rejected save", async () 
   expect(vault.saveState).toHaveBeenCalledTimes(3);
 });
 
+it("keeps the newest state durable when a browser callback saves during an older write", async () => {
+  const c = setup();
+  let release!: () => void;
+  let started!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let durable: unknown;
+  vi.mocked(vault.saveState)
+    .mockImplementationOnce(async (state) => {
+      started();
+      await held;
+      durable = state;
+    })
+    .mockImplementation(async (state) => {
+      durable = state;
+    });
+  const older = c["persist"]();
+  await firstStarted;
+  c["local"]!.paused = true;
+  const newer = c["persist"]();
+  await Promise.resolve();
+  release();
+  await Promise.all([older, newer]);
+  expect(durable).toMatchObject({ paused: true });
+});
+
+it("persists a return to the cached value after an in-flight different value", async () => {
+  const c = setup();
+  await c["persist"]();
+  let release!: () => void;
+  let started!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let durable: unknown;
+  vi.mocked(vault.saveState)
+    .mockImplementationOnce(async (state) => {
+      started();
+      await held;
+      durable = state;
+    })
+    .mockImplementation(async (state) => {
+      durable = state;
+    });
+  c["local"]!.paused = true;
+  const older = c["persist"]();
+  await firstStarted;
+  c["local"]!.paused = false;
+  const newer = c["persist"]();
+  release();
+  await Promise.all([older, newer]);
+  expect(durable).toMatchObject({ paused: false });
+});
+
+it("finishes queued writes before wiping so an older save cannot restore revoked data", async () => {
+  const c = setup();
+  let release!: () => void;
+  let started!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let durable: unknown;
+  vi.mocked(vault.saveState).mockImplementation(async (state) => {
+    started();
+    await held;
+    durable = state;
+  });
+  vi.mocked(vault.wipe).mockImplementation(async () => {
+    durable = undefined;
+  });
+  const saving = c["persist"]();
+  await firstStarted;
+  const wiping = c["wipeRevoked"]();
+  release();
+  await Promise.all([saving, wiping]);
+  expect(durable).toBeUndefined();
+  expect(c["local"]).toBeUndefined();
+});
+
 it("does not busy-reschedule browser evidence while halted or waiting for hydration", () => {
   const c = setup();
   c.events.changed(0);
@@ -1051,6 +1150,256 @@ it("does not busy-reschedule browser evidence while halted or waiting for hydrat
   c.failure(new Error("Signature mismatch"));
   expect(c.browserWorkPending).toBe(false);
   expect(c["halted"]).toBe(true);
+});
+
+it("releases a stale close guard after the signed journal acknowledgment preserves a peer edit", async () => {
+  const f = await fixture();
+  const c = setup();
+  configureEpochOne(c, f);
+  vi.mocked(c.pull).mockRestore();
+  const s = c["local"]!;
+  s.canonical.revision = 1;
+  s.canonical.windows.window = { id: "window", order: 0, changed: 1 };
+  s.canonical.tabs.tab = {
+    id: "tab",
+    window: "window",
+    kind: "web",
+    url: "https://example.test/newer",
+    pinned: false,
+    index: 0,
+    source: "peer",
+    writer: "peer",
+    changed: 1,
+  };
+  s.mapping.observed = structuredClone(s.canonical);
+  delete s.mapping.observed.tabs.tab;
+  s.mapping.freshness = {
+    generation: 1,
+    intents: {
+      tab: { generation: 1, kind: "delete", canonicalRevision: 0, journaled: true },
+    },
+  };
+  const operation: Operation = {
+    id: "stale-close",
+    sender: s.device.id,
+    sequence: 1,
+    base: 0,
+    changes: [{ type: "tab-delete", id: "tab" }],
+  };
+  s.queue = [{ sequence: 1, operation }];
+  const envelope = await encryptEnvelope(
+    f.root,
+    f.device.signing,
+    { ...f.snapshot.header, type: "operation", sequence: 1 },
+    operation,
+  );
+  c["auth"] = vi.fn(async () => ({
+    control: f.control,
+    chain: [],
+    operations: [{ revision: 2, envelope }],
+    revision: 2,
+    sequence: 1,
+    pending: [],
+    presence: {},
+  })) as (typeof c)["auth"];
+  vi.mocked(reconcile).mockImplementation(async (target, mapping, _source, _persist, mayMutate) => {
+    expect(mayMutate?.({ boundary: "test-create", logicalId: "tab", mutation: "create" })).toBe(
+      true,
+    );
+    return { ...mapping, observed: target };
+  });
+  await c.pull();
+  expect(s.queue).toHaveLength(0);
+  expect(s.mapping.freshness.intents.tab).toBeUndefined();
+  expect(s.mapping.observed.tabs).toMatchObject({ tab: { url: "https://example.test/newer" } });
+});
+
+it("keeps an explicit initial snapshot request across a same-epoch membership page", async () => {
+  const f = await fixture();
+  const c = setup();
+  configureEpochOne(c, f);
+  c["local"]!.canonical = emptyWorkspace();
+  vi.mocked(c.pull).mockRestore();
+  const member = await identity();
+  const added = await c["addMember"](member.device, f.device.signing, f.device.device.id);
+  let calls = 0;
+  c["auth"] = vi.fn(async (_action: string, payload: { force: boolean }) => {
+    if (++calls === 1)
+      return {
+        kind: "control",
+        chain: [added],
+        fromGeneration: 0,
+        nextGeneration: 1,
+        more: false,
+      };
+    return {
+      kind: "workspace",
+      generation: 1,
+      chain: [],
+      ...(payload.force ? { snapshot: f.snapshot } : {}),
+      operations: [],
+      from: 0,
+      next: 0,
+      more: false,
+      revision: 0,
+      sequence: 0,
+      pending: [],
+      presence: {},
+    };
+  }) as (typeof c)["auth"];
+  await c.pull(true);
+  expect(c["local"]!.canonical.id).toBe(f.workspace.id);
+});
+
+async function pendingPair() {
+  const f = await fixture();
+  const c = setup();
+  configureEpochOne(c, f);
+  const requester = await ephemeral();
+  const approver = await ephemeral();
+  const peer = await identity();
+  const request: PairRequest = {
+    id: "pair-test",
+    device: f.device.device,
+    commitment: requester.commitment,
+    expires: Date.now() + 60_000,
+    status: "pending",
+  };
+  c["local"]!.phase = "pending";
+  c["local"]!.request = request;
+  c["local"]!.pairSecrets[request.id] = requester;
+  const offered: PairRequest = {
+    ...request,
+    offer: { device: peer.device, commitment: approver.commitment },
+  };
+  return { c, offered, reveal: requester.reveal };
+}
+
+it("durably pins the approver before sending the requester reveal", async () => {
+  const { c, offered, reveal } = await pendingPair();
+  let durable: { request?: PairRequest } | undefined;
+  vi.mocked(vault.saveState).mockImplementation(async (state) => {
+    durable = state as typeof durable;
+  });
+  vi.spyOn(Api.prototype, "post").mockImplementation(async (action) => {
+    if (action === "pair-read") return offered;
+    expect(action).toBe("pair-reveal");
+    expect(durable?.request?.offer).toEqual(offered.offer);
+    return { ...offered, requesterReveal: reveal };
+  });
+  await c.pollPair();
+  expect(c["local"]!.request?.requesterReveal).toEqual(reveal);
+});
+
+it.each(["identity", "offer", "schema"])(
+  "rejects a changed %s in the reveal response without replacing pinned state",
+  async (change) => {
+    const { c, offered, reveal } = await pendingPair();
+    const response = {
+      ...offered,
+      requesterReveal: reveal,
+      ...(change === "identity" ? { device: { ...offered.device, id: "substituted" } } : {}),
+      ...(change === "offer" ? { offer: { ...offered.offer!, commitment: "changed" } } : {}),
+      ...(change === "schema" ? { status: "unknown" } : {}),
+    };
+    vi.spyOn(Api.prototype, "post").mockImplementation(async (action) =>
+      action === "pair-read" ? offered : response,
+    );
+    await expect(c.pollPair()).rejects.toThrow();
+    expect(c["local"]!.request).toEqual(offered);
+  },
+);
+
+it("does not reveal pairing material when the commitment pin cannot be saved", async () => {
+  const { c, offered } = await pendingPair();
+  const post = vi.spyOn(Api.prototype, "post").mockResolvedValue(offered);
+  vi.mocked(vault.saveState).mockRejectedValueOnce(new StorageInterruptedError(null));
+  await expect(c.pollPair()).rejects.toBeInstanceOf(StorageInterruptedError);
+  expect(post.mock.calls.map(([action]) => action)).toEqual(["pair-read"]);
+});
+
+it.each(["legacy", "paged"])(
+  "verifies %s recovery history before restoring the current root",
+  async (mode) => {
+    const f = await fixture();
+    const c = setup();
+    configureEpochOne(c, f);
+    const s = c["local"]!;
+    s.account = f.account;
+    s.phase = "draft";
+    const peer = await identity();
+    const added = await c["addMember"](peer.device, f.device.signing, f.device.device.id);
+    const post = vi.spyOn(Api.prototype, "post").mockResolvedValue({
+      recovery: f.control.recovery,
+      chain: mode === "legacy" ? [f.control, added] : [f.control],
+      ...(mode === "paged"
+        ? { kind: "control", fromGeneration: -1, nextGeneration: 0, more: true }
+        : {}),
+    });
+    const authenticated = vi.spyOn(Api.prototype, "authenticated").mockResolvedValue({
+      kind: "control",
+      chain: [added],
+      fromGeneration: 0,
+      nextGeneration: 1,
+      more: false,
+    });
+    await c.recover(s.server, f.account, "Test", recoveryCode(f.secret));
+    expect(post).toHaveBeenCalledWith("recover-info", { pagination: true });
+    expect(s.control).toEqual(added);
+    expect(s.root).toBe(base64(f.root));
+    expect(s.phase).toBe("merge");
+    if (mode === "paged")
+      expect(authenticated).toHaveBeenCalledWith(
+        "recover-chain",
+        { generation: 0 },
+        "recovery",
+        expect.anything(),
+      );
+    else expect(authenticated).not.toHaveBeenCalled();
+  },
+);
+
+it.each(["empty", "range", "signature"])(
+  "rejects a recovery continuation with invalid %s before authorizing or applying workspace state",
+  async (fault) => {
+    const f = await fixture();
+    const c = setup();
+    configureEpochOne(c, f);
+    const s = c["local"]!;
+    s.account = f.account;
+    s.phase = "draft";
+    const peer = await identity();
+    const added = await c["addMember"](peer.device, f.device.signing, f.device.device.id);
+    vi.spyOn(Api.prototype, "post").mockResolvedValue({
+      recovery: f.control.recovery,
+      kind: "control",
+      chain: [f.control],
+      fromGeneration: -1,
+      nextGeneration: 0,
+      more: true,
+    });
+    vi.spyOn(Api.prototype, "authenticated").mockResolvedValue({
+      kind: "control",
+      chain:
+        fault === "empty"
+          ? []
+          : [{ ...added, ...(fault === "signature" ? { actor: "invalid" } : {}) }],
+      fromGeneration: fault === "range" ? 1 : 0,
+      nextGeneration: 1,
+      more: false,
+    });
+    await expect(c.recover(s.server, f.account, "Test", recoveryCode(f.secret))).rejects.toThrow();
+    expect(s.phase).toBe("draft");
+    expect(c.pull).not.toHaveBeenCalled();
+  },
+);
+
+it.each([true, false])("respects paused=%s when the popup refreshes approvals", async (paused) => {
+  const c = setup();
+  configureEpochOne(c, await fixture());
+  c["local"]!.paused = paused;
+  await c.refreshApprovals();
+  expect(c.pull).toHaveBeenCalledTimes(paused ? 0 : 1);
 });
 
 it("retries an interrupted durable load on the next alarm without replacing identity", async () => {
@@ -1159,7 +1508,9 @@ describe("durable local intent recovery", () => {
         const stale = structuredClone(mapping);
         await c.navigationCommitted(7, "https://example.com/C", "history", []);
         await persist(stale);
-        expect(allowed?.(target.tabs.t, "navigate")).toBe(false);
+        expect(
+          allowed?.({ boundary: "test", logicalId: target.tabs.t!.id, mutation: "navigate" }),
+        ).toBe(false);
         throw new BrowserRuntimeRaceError();
       },
     );
@@ -1463,7 +1814,8 @@ describe("durable local intent recovery", () => {
     }) as (typeof c)["auth"];
     vi.mocked(reconcile).mockImplementation(
       async (target, mapping, _source, _persist, allowed = () => true) => {
-        if (!allowed(target.tabs.t, "navigate")) throw new BrowserRuntimeRaceError();
+        if (!allowed({ boundary: "test", logicalId: target.tabs.t!.id, mutation: "navigate" }))
+          throw new BrowserRuntimeRaceError();
         return { ...mapping, observed: target };
       },
     );

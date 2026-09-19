@@ -1,77 +1,182 @@
 # Relay
 
-Relay is an open-source browser extension and Cloudflare Worker for synchronizing tabs, windows, and supported tab groups across Chromium-based browsers.
+**End-to-end encrypted browser workspace sync for Chromium.**
+
+Relay is an open-source browser extension and Cloudflare backend that keeps tabs, windows, and supported tab groups synchronized across Chromium-based browsers without giving the sync service access to your browsing workspace.
+
+## Demo
+
+Account creation, device setup, and live synchronization in action:
+
+https://github.com/user-attachments/assets/892100c9-1324-4502-83f7-7dbcdd6c6a55
+
+<p align="center">
+  <img src="docs/assets/relay-settings.png" alt="Relay settings showing a live synchronized workspace" width="900">
+</p>
+
+<table>
+  <tr>
+    <td width="72%">
+      <img src="docs/assets/relay-onboarding.png" alt="Relay account creation screen">
+    </td>
+    <td width="28%">
+      <img src="docs/assets/relay-popup.png" alt="Relay popup showing a live workspace with two connected devices">
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Private, passwordless onboarding</strong></td>
+    <td align="center"><strong>Sync status at a glance</strong></td>
+  </tr>
+</table>
 
 ## Why Relay exists
 
-Browser sync is usually tied to a vendor account and often exposes more browsing data than a self-hosted tool should. Relay keeps the synchronized workspace encrypted on the client, uses a small coordination service to move ciphertext between authorized devices, and continues recording local changes while a device is offline.
+Browser sync is usually tied to a vendor account. Relay takes a different approach: devices hold the keys, workspace state is encrypted before leaving the browser, and the server primarily coordinates ciphertext between authorized devices.
 
-## Current features
+The result is a synchronized browser workspace that can continue recording changes while offline, recover cleanly after reconnecting, and be self-hosted without giving the server access to tab contents.
 
-- Syncs HTTP/HTTPS tabs, remote PDFs, new tabs, multiple windows, navigation, ordering, pinning, cross-window moves, and closure.
-- Syncs supported tab groups, including title, color, membership, grouping, ungrouping, and cross-window structure. Collapse state remains local.
-- Queues encrypted local changes while offline and reconciles them after reconnecting from canonical revisions and checkpoints.
-- Pairs devices through an approval flow with a committed, user-verifiable six-digit SAS.
-- Supports recovery enrollment, device revocation, per-device key provisioning, and best-effort online vault wipe.
-- Avoids syncing local-only and protected tabs; it does not create placeholders for them.
-- Persists the local journal, workspace state, device identity, and browser-to-workspace mapping in an encrypted local vault.
-- Uses durable mutation expectations, sender sequence numbers, and a bounded navigation circuit to reduce sync loops and stale destructive updates.
+## What Relay syncs
 
-The following are intentionally not synchronized: active-tab focus, window geometry, scroll position, incognito state, cookies, logins, site storage, bookmarks, and history. Browser-internal, file, extension, and other protected pages stay local.
+* **Tabs and windows** — HTTP/HTTPS tabs, remote PDFs, new tabs, navigation, ordering, pinning, cross-window moves, closures, and multiple windows.
+* **Tab groups** — title, color, membership, grouping, ungrouping, and cross-window structure. Collapse state remains local.
+* **Offline changes** — encrypted local changes are journaled while disconnected and reconciled against canonical revisions and checkpoints after reconnecting.
+* **Device pairing** — new devices join through an approval flow with a committed, user-verifiable six-digit SAS.
+* **Device lifecycle** — recovery enrollment, device revocation, per-device key provisioning, workspace-key rotation, and best-effort online vault wipe.
+* **Encrypted local state** — workspace state, the local journal, device identity, and browser-to-workspace mappings are persisted in an encrypted local vault.
+* **Conflict handling** — durable mutation expectations, sender sequence numbers, canonical revisions, and bounded navigation tracking reduce sync loops and prevent stale destructive updates.
+* **Protected-page handling** — local-only and browser-protected tabs stay local instead of being replaced with fake placeholders on peer devices.
+
+### Intentionally local
+
+Relay does **not** synchronize:
+
+* active-tab focus
+* window geometry
+* scroll position
+* incognito state
+* cookies
+* logins
+* site storage
+* bookmarks
+* browsing history
+
+Browser-internal pages, local files, extension pages, and other protected URLs also remain local.
 
 ## How it works
 
 ```text
-Browser extension A                                      Browser extension B
-tabs/windows + groups                                   tabs/windows + groups
-        │                                                        │
-        └── encrypted local vault + Web Crypto ──────────────────┘
-                              │
-                    HTTPS requests / WebSocket hints
-                              │
-                    Cloudflare Worker + Durable Object
-                    ciphertext, revisions, public controls
+Browser extension
+├─ observes tabs, windows, and groups
+├─ updates the encrypted local vault
+└─ creates signed + encrypted operations
+                     │
+                     ▼
+           HTTPS synchronization
+           + WebSocket change hints
+                     │
+                     ▼
+      Cloudflare Worker + RelayAccount
+              Durable Object
+      ├─ canonical revisions
+      ├─ encrypted operations
+      ├─ encrypted checkpoints
+      └─ public coordination state
+                     │
+                     ▼
+        peer devices pull changes
+          verify → decrypt → reconcile
+                     │
+                     ▼
+              Browser extension
 ```
 
-The extension captures browser events, applies them to a local journal, and sends signed encrypted envelopes to the account’s Durable Object. The server assigns canonical revisions, stores encrypted operations and checkpoints in SQLite-backed Durable Object storage, and uses hibernating WebSockets only for change hints and revocation notices. Clients pull, verify, decrypt, and reconcile the canonical state.
+Browser events are first applied to a local journal. Relay then sends signed, encrypted envelopes to the account's Durable Object.
 
-Concurrent non-destructive edits resolve by accepted server revision. Stale deletes are rejected when a peer changed the resource after the operation’s base revision. Durable expected-mutation records, identity checks, and sequence watermarks prevent remote updates from being mistaken for new local edits.
+The server assigns canonical revisions and stores encrypted operations and checkpoints in SQLite-backed Durable Object storage. Hibernating WebSockets are used only for lightweight change hints and revocation notices; clients still pull, verify, decrypt, and reconcile canonical state themselves.
+
+Concurrent non-destructive edits resolve according to accepted server revision. Stale deletes are rejected when another device changed the resource after the operation's base revision. Expected-mutation records, identity checks, sequence watermarks, and bounded navigation tracking help prevent remotely applied changes from being mistaken for new local edits.
 
 ## Security and privacy
 
-- Workspace data is encrypted on devices with AES-256-GCM. The Worker coordinates ciphertext and cannot decrypt synchronized tab data.
-- Device signing and agreement keys use P-256 ECDSA/ECDH. Private device keys are non-extractable CryptoKeys stored in the browser’s IndexedDB-backed vault.
-- Device names and membership metadata are carried in signed control records and encrypted where they are part of workspace state; pending pairing requests do not expose friendly names or page data.
-- A new device must be approved by an authorized device. Pairing commits both sides of an ephemeral exchange and requires matching SAS values before workspace keys are provisioned.
-- Revocation creates a new workspace-key epoch and reprovisions only retained devices. An online revoked device verifies the signed removal chain, clears its Relay vault, and disconnects; its browser tabs are left open.
-- The account number identifies a server-side Durable Object but is not an encryption key or authorization credential. Recovery uses a separate secret and signing identity.
+Relay is designed so the coordination service does not need access to synchronized workspace contents.
 
-Relay still assumes the browser, operating system, installed extension, and authorized devices are trusted. The server can observe traffic metadata, timing, sizes, revisions, IP addresses, and public membership records. See the [threat model](docs/THREAT-MODEL.md) for the remaining limits.
+* Workspace data is encrypted on devices with **AES-256-GCM**.
+* Device signing and key agreement use **P-256 ECDSA/ECDH**.
+* Private device keys are stored as non-extractable `CryptoKey` objects in the browser's IndexedDB-backed vault.
+* A new device must be approved by an already authorized device.
+* Pairing commits both sides of an ephemeral key exchange and requires matching six-digit SAS values before workspace keys are provisioned.
+* Device revocation creates a new workspace-key epoch and reprovisions only retained devices.
+* An online revoked device verifies the signed removal chain, clears its Relay vault, disconnects, and leaves its existing browser tabs untouched.
+* Device names and membership metadata are carried in signed control records and encrypted where they form part of workspace state.
+* Pending pairing requests do not expose friendly device names or page data.
+* The account number identifies the server-side Durable Object but is **not** an encryption key or authorization credential.
+* Account recovery uses a separate recovery secret and signing identity.
 
-## Repository and stack
+The Worker coordinates ciphertext and cannot decrypt synchronized tab data.
 
-- `apps/extension` — vanilla TypeScript browser extension, popup, settings, onboarding, browser adapters, local vault, and sync lifecycle.
-- `apps/server` — Cloudflare Worker and `RelayAccount` Durable Object with SQLite storage, rate limits, HTTP synchronization, and hibernating WebSockets.
-- `packages/protocol` — validated wire messages, encrypted workspace envelopes, membership controls, reconciliation, and tab-group state.
-- `packages/crypto` — Web Crypto primitives, envelopes, key wrapping, recovery, and committed pairing.
-- `packages/shared` — URL policy, configuration, limits, and shared validation.
+Relay still assumes the browser, operating system, installed extension, and currently authorized devices are trusted. The server can observe metadata such as traffic timing, message sizes, revisions, IP addresses, and public membership records.
 
-The project uses TypeScript, pnpm workspaces, Web Crypto, Cloudflare Workers/Durable Objects, Wrangler, Vitest, Playwright, and Biome.
+For the full security model and remaining limitations, see the [threat model](docs/THREAT-MODEL.md).
+
+## Repository structure
+
+```text
+apps/
+├─ extension/    Chromium extension, UI, browser adapters,
+│                local vault, and synchronization lifecycle
+└─ server/       Cloudflare Worker and RelayAccount Durable Object
+
+packages/
+├─ protocol/     Wire messages, encrypted workspace envelopes,
+│                reconciliation, membership controls, and tab groups
+├─ crypto/       Web Crypto primitives, envelopes, key wrapping,
+│                recovery, and committed pairing
+└─ shared/       URL policy, configuration, limits, and validation
+```
+
+Relay is built with:
+
+* TypeScript
+* pnpm workspaces
+* Web Crypto
+* Cloudflare Workers
+* Durable Objects + SQLite
+* Wrangler
+* Vitest
+* Playwright
+* Biome
 
 ## Development
 
-Requirements: Node.js 22.12 or newer and pnpm 10.20.0.
+### Requirements
 
-Install dependencies and start the local Worker plus development extension build:
+* Node.js 22.12 or newer
+* pnpm 10.20.0
+
+Install dependencies and start the local Worker and development extension build:
 
 ```sh
 pnpm install
 pnpm dev
 ```
 
-Load `apps/extension/dist` as an unpacked extension in two separate Chromium browser profiles. During setup, choose `http://localhost:8787`. Local Wrangler state is kept under `apps/server/.wrangler/state` when using the LAN server mode.
+Then load `apps/extension/dist` as an unpacked extension in two separate Chromium browser profiles.
 
-Useful checks:
+During onboarding, choose:
+
+```text
+http://localhost:8787
+```
+
+Local Wrangler state is stored under:
+
+```text
+apps/server/.wrangler/state
+```
+
+when using the LAN server mode.
+
+### Quality checks
 
 ```sh
 pnpm lint
@@ -80,21 +185,48 @@ pnpm test
 pnpm build
 ```
 
-For the browser end-to-end suite, keep the local server running, install the Playwright browser once, and run:
+### Browser end-to-end tests
+
+Keep the local server running, install the Playwright Chromium build once, then run:
 
 ```sh
 pnpm exec playwright install chromium
 pnpm test:e2e
 ```
 
-See the [development guide](docs/DEVELOPMENT.md) for the two-profile workflow and manual scenarios. See [self-hosting](docs/SELF-HOSTING.md) for Cloudflare deployment and custom Worker origins.
+See the [development guide](docs/DEVELOPMENT.md) for the two-profile workflow and manual test scenarios.
+
+See [self-hosting](docs/SELF-HOSTING.md) for Cloudflare deployment and custom Worker origins.
 
 ## Project status
 
-Relay is functional pre-release software (`0.1.0`) and has not had an independent security review or Chrome Web Store release. The current implementation is a single-account device synchronization system; authorized devices are equally privileged. Account migration, bookmarks, history, nested groups, Firefox support, forward-secrecy ratcheting, and guaranteed remote erasure are not implemented.
+Relay is functional pre-release software (`0.1.0`).
 
-Further design detail is available in the [architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md), and [cryptography](docs/CRYPTOGRAPHY.md) documents.
+It has **not** received an independent security review and has not been released on the Chrome Web Store. The current implementation is a single-account device synchronization system in which authorized devices are equally privileged.
+
+Not currently implemented:
+
+* account migration
+* bookmark synchronization
+* history synchronization
+* nested tab groups
+* Firefox support
+* forward-secrecy ratcheting
+* guaranteed remote erasure
+
+Additional implementation and design documentation:
+
+* [Architecture](docs/ARCHITECTURE.md)
+* [Protocol](docs/PROTOCOL.md)
+* [Cryptography](docs/CRYPTOGRAPHY.md)
+* [Threat model](docs/THREAT-MODEL.md)
+* [Development](docs/DEVELOPMENT.md)
+* [Self-hosting](docs/SELF-HOSTING.md)
 
 ## License
 
-Relay is licensed under [AGPL-3.0-or-later](LICENSE). See [TRADEMARKS.md](TRADEMARKS.md) for branding notes. Relay is independent of Helium and is not affiliated with or endorsed by Helium.
+Relay is licensed under [AGPL-3.0-or-later](LICENSE).
+
+See [TRADEMARKS.md](TRADEMARKS.md) for branding notes.
+
+Relay is independent of Helium and is not affiliated with or endorsed by Helium.

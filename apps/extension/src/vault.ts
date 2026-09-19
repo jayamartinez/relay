@@ -81,7 +81,8 @@ export async function wipe(): Promise<void> {
       const tx = db.transaction("vault", "readwrite");
       tx.objectStore("vault").clear();
       tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(storageError(tx.error));
+      tx.onerror = () => reject(storageError(tx.error));
     });
   } finally {
     db.close();

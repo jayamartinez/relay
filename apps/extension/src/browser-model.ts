@@ -39,6 +39,9 @@ export interface Mapping {
   groups?: Record<string, string>;
   collapsed?: Record<string, boolean>;
   ignoredWindows?: number[];
+  // Windows explicitly present during setup/merge but containing no syncable tabs yet.
+  // Their first syncable tab may be adopted without importing unrelated restore windows.
+  adoptableWindows?: number[];
   navigation?: Record<string, NavigationReceipt>;
   /**
    * Device-local user intent which has been observed but may not be committed yet.

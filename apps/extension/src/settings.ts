@@ -30,6 +30,8 @@ let section = "General";
 let busy = false;
 let lastView = "";
 let refreshing = false;
+let lastAttention = "";
+let lastContext = "";
 let revealed = false;
 let nameValue = navigator.userAgent.includes("Windows")
   ? "Windows Desktop"
@@ -60,24 +62,37 @@ function errorMessage(text: string): HTMLElement {
   message.setAttribute("role", "alert");
   return message;
 }
-async function act(action: string, payload: Record<string, unknown> = {}) {
+async function perform(action: () => Promise<void>) {
   if (busy) return;
   busy = true;
+  const controls = Array.from(
+    app?.querySelectorAll<HTMLButtonElement | HTMLInputElement>("button, input") ?? [],
+  ).filter((control) => !control.disabled);
+  for (const control of controls) control.disabled = true;
+  app?.setAttribute("aria-busy", "true");
   try {
-    state = await call(action, payload);
-    screen = "welcome";
-    render();
+    await action();
   } catch (error) {
     try {
       state = await call("status");
       render();
     } catch {
       // Keep the original action error if status itself cannot be refreshed.
+      if (state) render();
     }
     report(error);
   } finally {
     busy = false;
+    for (const control of controls) control.disabled = false;
+    app?.setAttribute("aria-busy", "false");
   }
+}
+async function act(action: string, payload: Record<string, unknown> = {}) {
+  await perform(async () => {
+    state = await call(action, payload);
+    screen = "welcome";
+    render();
+  });
 }
 function saveRecovery() {
   const blob = new Blob(
@@ -118,9 +133,7 @@ function controls() {
   return el("div", "", name.wrapper, detail);
 }
 async function testConnection() {
-  if (busy) return;
-  busy = true;
-  try {
+  await perform(async () => {
     const origin = serverOrigin(serverValue || state.server, true);
     const granted = await chrome.permissions.request({ origins: [`${origin}/*`] });
     if (!granted) throw new Error("Server permission was denied. No connection was made.");
@@ -128,21 +141,17 @@ async function testConnection() {
     state = await call("status");
     render();
     app?.append(el("p", result.ok ? "" : "error", result.message));
-  } catch (error) {
-    report(error);
-  } finally {
-    busy = false;
-  }
+  });
 }
 async function withPermission(action: string, payload: Record<string, unknown>) {
-  try {
+  await perform(async () => {
     const origin = serverOrigin(serverValue || state.server, __DEV__);
     const granted = await chrome.permissions.request({ origins: [`${origin}/*`] });
     if (!granted) throw new Error("Server permission was denied. No connection was made.");
-    await act(action, { server: origin, name: nameValue, ...payload });
-  } catch (error) {
-    report(error);
-  }
+    state = await call(action, { server: origin, name: nameValue, ...payload });
+    screen = "welcome";
+    render();
+  });
 }
 function confirmation(
   label: string,
@@ -218,6 +227,7 @@ function onboarding(): HTMLElement {
     );
     body.append(button("Cancel setup", () => void act("cancel")));
   } else if (state.phase === "pending" && screen !== "recover") {
+    const code = state.pair?.sas;
     body.append(
       el("div", "eyebrow", "02 — Authorize this device"),
       el("h1", "", "Waiting for approval"),
@@ -227,21 +237,21 @@ function onboarding(): HTMLElement {
         "On an authorized device, open Relay → Devices → Review. No Relay device available? Keep this page open, or use your recovery key.",
       ),
     );
-    if (state.pair?.sas)
+    if (code)
       body.append(
         el("div", "eyebrow", "Verification code"),
-        el("div", "code", groupedCode(state.pair.sas)),
+        el("div", "code", groupedCode(code)),
         el(
           "p",
           "",
           "Compare this code on both devices. If they differ, cancel. Never approve a request you did not start.",
         ),
       );
-    if (state.pair?.status === "approved")
+    if (state.pair?.status === "approved" && code)
       body.append(
         confirmation(
           "The code matches the device I approved.",
-          () => void act("finish-pair", { code: state.pair?.sas }),
+          () => void act("finish-pair", { code }),
           "Finish authorization",
         ),
       );
@@ -689,23 +699,51 @@ function settings() {
         ),
       );
     if (state.startTrace?.length) development.append(el("pre", "", state.startTrace.join("\n")));
-    if (state.runtime || state.behavior)
-      development.append(
-        el(
-          "pre",
-          "",
-          JSON.stringify({ runtime: state.runtime, behavior: state.behavior }, null, 2),
-        ),
+    if (state.runtime || state.behavior) {
+      const diagnostics = JSON.stringify(
+        { runtime: state.runtime, behavior: state.behavior },
+        null,
+        2,
       );
+      development.append(
+        button(
+          "Copy diagnostics",
+          () => void navigator.clipboard.writeText(diagnostics).catch(report),
+          "secondary compact",
+        ),
+        el("pre", "", diagnostics),
+      );
+    }
     content.append(development);
   }
   return el("div", "grid", nav, content);
+}
+function attentionKey(value: Status) {
+  return JSON.stringify([
+    value.phase,
+    value.account,
+    value.device,
+    value.server,
+    value.error,
+    value.pair,
+    value.approvals,
+    value.status,
+    value.paused,
+    value.preferences,
+  ]);
 }
 function render() {
   if (!app) return;
   // A join/recovery draft has no newly generated recovery key. Keep it retryable,
   // including after a settings-page reload, instead of offering Start syncing.
   if (state.phase === "draft" && !state.recovery && screen === "welcome") screen = "join";
+  const context = JSON.stringify([state.phase, state.account, state.server, screen, section]);
+  // Keep an unsent recovery draft through redraws only in the same account and view.
+  const recoveryDraft =
+    context === lastContext
+      ? app.querySelector<HTMLInputElement>(".recovery-field")?.value
+      : undefined;
+  if (context !== lastContext) revealed = false;
   app.className = "shell";
   app.classList.toggle("onboarding-shell", state.phase !== "active");
   app.classList.toggle(
@@ -720,6 +758,8 @@ function render() {
     (errorTarget ?? page).prepend(errorMessage(state.error));
   }
   app.append(page);
+  const recoveryField = app.querySelector<HTMLInputElement>(".recovery-field");
+  if (recoveryField && recoveryDraft !== undefined) recoveryField.value = recoveryDraft;
   app.append(
     el(
       "footer",
@@ -728,15 +768,19 @@ function render() {
     ),
   );
   lastView = statusViewKey(state);
+  lastAttention = attentionKey(state);
+  lastContext = context;
 }
 async function refresh() {
   if (busy || refreshing || document.hidden) return;
   refreshing = true;
   try {
     const next = await call("status", { poll: state?.phase === "pending" });
+    if (busy) return;
     const changed = statusViewKey(next) !== lastView;
+    const needsAttention = attentionKey(next) !== lastAttention;
     state = next;
-    if (changed && document.activeElement?.tagName !== "INPUT") render();
+    if (changed && (needsAttention || document.activeElement?.tagName !== "INPUT")) render();
   } catch (error) {
     report(error);
   } finally {

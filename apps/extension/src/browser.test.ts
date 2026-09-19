@@ -4,6 +4,7 @@ import { capture, reconcile } from "./browser";
 import { BrowserEvents } from "./browser-events";
 import { browserWorkspace, type Mapping, observe } from "./browser-model";
 import { BrowserRuntimeRaceError } from "./browser-runtime";
+import { initialMerge } from "./workspace-lifecycle";
 
 afterEach(() => vi.unstubAllGlobals());
 function fixture(existing: boolean) {
@@ -132,6 +133,102 @@ it("keeps both duplicate URLs when a new tab appears before an already mapped ta
   expect(Object.keys(result.workspace.tabs)).toHaveLength(2);
 });
 
+it("adopts the first syncable tab opened in a protected-only setup window", async () => {
+  const extensionTab = {
+    id: 10,
+    windowId: 1,
+    index: 0,
+    pinned: false,
+    incognito: false,
+    url: "chrome-extension://relay/settings.html",
+  };
+  const webTab = {
+    id: 11,
+    windowId: 1,
+    index: 1,
+    pinned: false,
+    incognito: false,
+    url: "https://example.com/",
+  };
+  let live = [extensionTab];
+  vi.stubGlobal("chrome", {
+    runtime: { getURL: () => "chrome-extension://relay/" },
+    storage: { session: { get: async () => ({ browserSession: "session" }) } },
+    windows: { getAll: async () => [{ id: 1, tabs: live, incognito: false }] },
+    tabs: { query: async () => live },
+  });
+  const empty = emptyWorkspace();
+  const mapping: Mapping = {
+    session: "",
+    windows: {},
+    tabs: {},
+    expected: [],
+    observed: empty,
+  };
+  const enrolled = initialMerge(
+    [
+      {
+        local: 1,
+        tabs: [
+          {
+            local: 10,
+            window: 1,
+            index: 0,
+            pinned: false,
+            incognito: false,
+            url: extensionTab.url,
+          },
+        ],
+      },
+    ],
+    mapping,
+    empty,
+    "session",
+    "device",
+    "chrome-extension://relay",
+  );
+  expect(enrolled.mapping.adoptableWindows).toEqual([1]);
+
+  live = [extensionTab, webTab];
+  const result = await capture(enrolled.mapping, "device", new BrowserEvents().pending, empty);
+
+  expect(result.changes.map((change) => change.type)).toEqual(["window-create", "tab-create"]);
+  expect(result.mapping.adoptableWindows).toEqual([]);
+  expect(result.mapping.ignoredWindows).toEqual([]);
+});
+
+it("does not adopt an unrelated unmapped window without enrollment evidence", async () => {
+  const live = [
+    {
+      id: 11,
+      windowId: 1,
+      index: 0,
+      pinned: false,
+      incognito: false,
+      url: "https://example.com/",
+    },
+  ];
+  vi.stubGlobal("chrome", {
+    runtime: { getURL: () => "chrome-extension://relay/" },
+    storage: { session: { get: async () => ({ browserSession: "session" }) } },
+    windows: { getAll: async () => [{ id: 1, tabs: live, incognito: false }] },
+    tabs: { query: async () => live },
+  });
+  const empty = emptyWorkspace();
+  const mapping: Mapping = {
+    session: "session",
+    windows: {},
+    tabs: {},
+    expected: [],
+    observed: empty,
+  };
+
+  const result = await capture(mapping, "device", new BrowserEvents().pending, empty);
+
+  expect(result.changes).toEqual([]);
+  expect(result.mapping.ignoredWindows).toEqual([1]);
+});
+
 it("does not replay a stale deletion after a tab navigates during reconciliation", async () => {
   const f = fixture(true);
   const get = vi.fn(
@@ -211,7 +308,7 @@ it("does not recreate a tab when a user close supersedes a stale reconcile plan"
         // fresh delete intent before Chrome is allowed to create the missing tab.
         closed = true;
       },
-      (tab) => !(closed && tab?.id === "tab"),
+      (context) => !(closed && context?.logicalId === "tab"),
     ),
   ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
   expect(f.create).not.toHaveBeenCalled();
@@ -230,7 +327,7 @@ it("does not restore an older URL when a user navigation supersedes its reconcil
         // construction and the awaited tabs.get/tabs.update boundary.
         navigated = true;
       },
-      (tab, mutation) => !(navigated && tab?.id === "tab" && mutation === "navigate"),
+      (context) => !(navigated && context?.logicalId === "tab" && context.mutation === "navigate"),
     ),
   ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
   expect(f.update).not.toHaveBeenCalled();
@@ -254,7 +351,45 @@ it("does not restore an old URL while a discarded tab is waking into a user navi
       f.mapping,
       "device",
       async () => {},
-      (tab, mutation) => !(tab?.id === "tab" && mutation === "navigate"),
+      (context) => !(context?.logicalId === "tab" && context.mutation === "navigate"),
+    ),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+  expect(f.update).not.toHaveBeenCalled();
+});
+
+it("checks the first tab's delete intent before creating its missing window", async () => {
+  const f = fixture(false);
+  f.mapping.windows = {};
+  chrome.windows.create = vi.fn(async () => ({
+    id: 2,
+    tabs: [
+      { id: 8, windowId: 2, index: 0, pinned: false, incognito: false, url: f.target.tabs.tab.url },
+    ],
+  })) as unknown as typeof chrome.windows.create;
+  await expect(
+    reconcile(
+      f.target,
+      f.mapping,
+      "device",
+      async () => {},
+      (context) => context?.logicalId !== "tab",
+    ),
+  ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
+  expect(chrome.windows.create).not.toHaveBeenCalled();
+});
+
+it("rechecks a user navigation received while its remote receipt was being saved", async () => {
+  const f = fixture(true);
+  let navigated = false;
+  await expect(
+    reconcile(
+      { ...f.target, tabs: { tab: { ...f.target.tabs.tab, url: "https://example.com/old" } } },
+      f.mapping,
+      "device",
+      async (mapping) => {
+        if (mapping.navigation?.tab) navigated = true;
+      },
+      (context) => !(navigated && context?.logicalId === "tab" && context.mutation === "navigate"),
     ),
   ).rejects.toBeInstanceOf(BrowserRuntimeRaceError);
   expect(f.update).not.toHaveBeenCalled();
