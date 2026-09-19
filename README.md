@@ -4,14 +4,10 @@ Relay is an open-source browser extension and Cloudflare Worker for synchronizin
 
 ## Preview
 
-<p align="center">
-  <a href="docs/assets/relay-preview.mp4">
-    <img src="docs/assets/relay-settings.png" alt="Relay settings showing a live synchronized workspace" width="900">
-  </a>
-</p>
+https://github.com/user-attachments/assets/892100c9-1324-4502-83f7-7dbcdd6c6a55
 
 <p align="center">
-  <a href="docs/assets/relay-preview.mp4"><strong>Watch the two-device synchronization demo</strong></a>
+  <img src="docs/assets/relay-settings.png" alt="Relay settings showing a live synchronized workspace" width="900">
 </p>
 
 <table>
