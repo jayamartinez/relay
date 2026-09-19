@@ -79,17 +79,28 @@ export async function capture(
   const actual = await browserWindows();
   if (!actual.length) return { mapping, changes: [], bootstrap: false, shutdown: true };
   const seed = structuredClone(mapping);
+  const actualWindows = new Set(actual.map((window) => window.local));
+  const adoptableWindows = new Set(
+    (seed.adoptableWindows ?? []).filter((window) => actualWindows.has(window)),
+  );
   const ownedCommits = new Set<number>();
   for (const [tab, commit] of evidence.commits ?? [])
     if (committedNavigation(seed, tab, commit.url, commit.transition, commit.qualifiers))
       ownedCommits.add(tab);
-  seed.ignoredWindows = (seed.ignoredWindows ?? []).filter(
-    (id) => !evidence.createdWindows.has(id),
+  const ignoredWindows = new Set(
+    (seed.ignoredWindows ?? []).filter(
+      (id) => !evidence.createdWindows.has(id) && !adoptableWindows.has(id),
+    ),
   );
   // A disappearing unmapped window is never sufficient evidence for a new import.
   for (const window of actual)
-    if (!seed.windows[window.local] && !evidence.createdWindows.has(window.local))
-      seed.ignoredWindows.push(window.local);
+    if (
+      !seed.windows[window.local] &&
+      !evidence.createdWindows.has(window.local) &&
+      !adoptableWindows.has(window.local)
+    )
+      ignoredWindows.add(window.local);
+  seed.ignoredWindows = [...ignoredWindows];
   // A query can already expose the NEXT provisional URL while we process a prior
   // committed event. Observe the settled event URL, never that racing pendingUrl.
   for (const tab of actual.flatMap((window) => window.tabs)) {
@@ -99,6 +110,9 @@ export async function capture(
     tab.url = event?.url ?? (prior.kind === "newtab" ? "about:blank" : prior.url);
   }
   const result = observe(actual, seed, await sessionId(), source, ownOrigin());
+  result.mapping.adoptableWindows = [...adoptableWindows].filter(
+    (window) => !result.mapping.windows[window],
+  );
   // Keep unsettled tabs at their prior observed URL while independently settled tabs advance.
   for (const local of evidence.unsettledTabs ?? []) {
     const logical = result.mapping.tabs[local];

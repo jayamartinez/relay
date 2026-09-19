@@ -4,6 +4,7 @@ import { capture, reconcile } from "./browser";
 import { BrowserEvents } from "./browser-events";
 import { browserWorkspace, type Mapping, observe } from "./browser-model";
 import { BrowserRuntimeRaceError } from "./browser-runtime";
+import { initialMerge } from "./workspace-lifecycle";
 
 afterEach(() => vi.unstubAllGlobals());
 function fixture(existing: boolean) {
@@ -130,6 +131,102 @@ it("keeps both duplicate URLs when a new tab appears before an already mapped ta
   expect(result.mapping.tabs[7]).toBe("tab");
   expect(result.mapping.tabs[8]).not.toBe("tab");
   expect(Object.keys(result.workspace.tabs)).toHaveLength(2);
+});
+
+it("adopts the first syncable tab opened in a protected-only setup window", async () => {
+  const extensionTab = {
+    id: 10,
+    windowId: 1,
+    index: 0,
+    pinned: false,
+    incognito: false,
+    url: "chrome-extension://relay/settings.html",
+  };
+  const webTab = {
+    id: 11,
+    windowId: 1,
+    index: 1,
+    pinned: false,
+    incognito: false,
+    url: "https://example.com/",
+  };
+  let live = [extensionTab];
+  vi.stubGlobal("chrome", {
+    runtime: { getURL: () => "chrome-extension://relay/" },
+    storage: { session: { get: async () => ({ browserSession: "session" }) } },
+    windows: { getAll: async () => [{ id: 1, tabs: live, incognito: false }] },
+    tabs: { query: async () => live },
+  });
+  const empty = emptyWorkspace();
+  const mapping: Mapping = {
+    session: "",
+    windows: {},
+    tabs: {},
+    expected: [],
+    observed: empty,
+  };
+  const enrolled = initialMerge(
+    [
+      {
+        local: 1,
+        tabs: [
+          {
+            local: 10,
+            window: 1,
+            index: 0,
+            pinned: false,
+            incognito: false,
+            url: extensionTab.url,
+          },
+        ],
+      },
+    ],
+    mapping,
+    empty,
+    "session",
+    "device",
+    "chrome-extension://relay",
+  );
+  expect(enrolled.mapping.adoptableWindows).toEqual([1]);
+
+  live = [extensionTab, webTab];
+  const result = await capture(enrolled.mapping, "device", new BrowserEvents().pending, empty);
+
+  expect(result.changes.map((change) => change.type)).toEqual(["window-create", "tab-create"]);
+  expect(result.mapping.adoptableWindows).toEqual([]);
+  expect(result.mapping.ignoredWindows).toEqual([]);
+});
+
+it("does not adopt an unrelated unmapped window without enrollment evidence", async () => {
+  const live = [
+    {
+      id: 11,
+      windowId: 1,
+      index: 0,
+      pinned: false,
+      incognito: false,
+      url: "https://example.com/",
+    },
+  ];
+  vi.stubGlobal("chrome", {
+    runtime: { getURL: () => "chrome-extension://relay/" },
+    storage: { session: { get: async () => ({ browserSession: "session" }) } },
+    windows: { getAll: async () => [{ id: 1, tabs: live, incognito: false }] },
+    tabs: { query: async () => live },
+  });
+  const empty = emptyWorkspace();
+  const mapping: Mapping = {
+    session: "session",
+    windows: {},
+    tabs: {},
+    expected: [],
+    observed: empty,
+  };
+
+  const result = await capture(mapping, "device", new BrowserEvents().pending, empty);
+
+  expect(result.changes).toEqual([]);
+  expect(result.mapping.ignoredWindows).toEqual([1]);
 });
 
 it("does not replay a stale deletion after a tab navigates during reconciliation", async () => {
