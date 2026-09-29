@@ -1,50 +1,67 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { adjacentApprovalId, approvalPosition, currentApproval, SingleFlight } from "./approval-ui";
-import { formatRelayBuild } from "./build-info";
 import type { Status } from "./controller";
 import { watchStatus } from "./status-channel";
 import { statusViewKey } from "./status-view";
-import { ago, brand, button, call, countLabel, el, groupedCode, masked, statusBadge } from "./ui";
+import {
+  ago,
+  alertMessage,
+  brand,
+  button,
+  call,
+  countLabel,
+  el,
+  groupedCode,
+  icon,
+  statusBadge,
+  syncedLabel,
+} from "./ui";
 
-declare const __PRODUCT_VERSION__: string;
-declare const __BUILD_ID__: string;
 const app = document.getElementById("app");
 const requests = new SingleFlight();
+const MAX_DEVICES = 5;
 let state: Status;
 let selectedId: string | undefined;
 let localError: string | undefined;
 let localAction: "approve" | "deny" | undefined;
 let resultTimer: ReturnType<typeof setTimeout> | undefined;
+let lastViewKind = "";
 
-function footer() {
-  return el(
-    "div",
-    "footer",
-    `End-to-end encrypted · ${formatRelayBuild(__PRODUCT_VERSION__, __BUILD_ID__)}`,
-  );
+/** Plays the entrance motion only when the popup switches to a different view. */
+function enter(popup: HTMLElement, kind: string) {
+  if (kind !== lastViewKind) popup.children[1]?.classList.add("rl-enter");
+  lastViewKind = kind;
 }
 
-function errorMessage(text: string) {
-  const message = el(
-    "div",
-    "error popup-error",
-    el("span", "error-title", "Couldn’t complete that"),
-    el("p", "", text),
-  );
-  message.setAttribute("role", "alert");
-  return message;
-}
-
-function approvalHeader(label = "Needs attention") {
-  return el("header", "popup-header", brand(), statusBadge(label));
+function header(label: string) {
+  return el("header", "rl-popup-header", brand(), statusBadge(label));
 }
 
 function settingsControl() {
-  return button(
-    "Settings →",
+  const control = button(
+    ["Settings", icon("external")],
     () => void chrome.runtime.openOptionsPage().catch(showError),
-    "ghost compact",
+    "rl-btn rl-btn--ghost rl-btn--sm",
+  );
+  control.setAttribute("aria-label", "Settings");
+  return control;
+}
+
+function footer(...children: HTMLElement[]) {
+  return el("footer", "rl-popup-footer", ...children);
+}
+
+function body(...children: (HTMLElement | undefined)[]) {
+  return el("section", "rl-popup-body", ...children);
+}
+
+function heading(text: string, meta?: string) {
+  return el(
+    "div",
+    "rl-workspace",
+    el("h2", "rl-title rl-title--sm", text),
+    meta ? el("p", "rl-small", meta) : undefined,
   );
 }
 
@@ -57,76 +74,101 @@ function navigate(offset: -1 | 1) {
   void prepareCurrentRequest();
 }
 
+function spinner() {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 28 28");
+  svg.setAttribute("class", "rl-spinner");
+  svg.setAttribute("aria-hidden", "true");
+  const track = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  for (const [key, value] of Object.entries({
+    cx: "14",
+    cy: "14",
+    r: "11",
+    fill: "none",
+    stroke: "var(--rl-line-strong)",
+    "stroke-width": "2.5",
+  }))
+    track.setAttribute(key, value);
+  const arc = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  for (const [key, value] of Object.entries({
+    d: "M14 3a11 11 0 0 1 11 11",
+    fill: "none",
+    stroke: "var(--rl-signal-text)",
+    "stroke-width": "2.5",
+    "stroke-linecap": "round",
+  }))
+    arc.setAttribute(key, value);
+  svg.append(track, arc);
+  return svg;
+}
+
+function result(title: string, copy: string, graphic: Element) {
+  return el(
+    "section",
+    "rl-result",
+    graphic,
+    el(
+      "div",
+      "rl-result-copy",
+      el("h2", "rl-title rl-title--sm", title),
+      el("p", "rl-small", copy),
+    ),
+  );
+}
+
 function resultView() {
   const activity = state.approvalActivity;
   if (!activity && !localAction) return undefined;
   if (activity?.status === "working" || localAction) {
     const approving = (localAction ?? activity?.action) === "approve";
-    return el(
-      "section",
-      "popup-approval popup-progress",
-      el("div", "eyebrow", "New device request"),
-      el("h2", "", approving ? "Approving device…" : "Denying request…"),
-      el(
-        "p",
-        "popup-approval-copy",
-        approving ? "Secure approval continues if this popup closes." : "Updating Relay…",
-      ),
+    return result(
+      approving ? "Approving device…" : "Denying request…",
+      approving ? "Secure approval continues if you close this popup." : "Updating Relay…",
+      spinner(),
     );
   }
   if (!activity) return undefined;
   if (activity.status === "failed") {
     const canRetry = state.approvals.some((request) => request.id === activity.requestId);
-    return el(
-      "section",
-      "popup-approval popup-progress",
-      el("div", "eyebrow", "New device request"),
+    return body(
       el(
         "h2",
-        "",
-        activity.action === "approve" ? "Could not approve device" : "Could not deny request",
+        "rl-title rl-title--sm",
+        activity.action === "approve" ? "Couldn’t approve the device" : "Couldn’t deny the request",
       ),
-      errorMessage(activity.error ?? "Relay could not complete this action."),
-      ...(canRetry
-        ? [
-            el(
-              "div",
-              "popup-approval-actions",
-              button(
-                activity.action === "approve" ? "Review again" : "Retry",
-                () =>
-                  void (activity.action === "approve"
-                    ? dismissResult()
-                    : runApproval(activity.action, activity.requestId)),
-                "primary compact",
-              ),
-            ),
-          ]
-        : []),
-      button("Back", () => void dismissResult(), "ghost compact"),
+      alertMessage(activity.error ?? "Relay could not complete this action."),
+      el(
+        "div",
+        "rl-actions rl-actions--fill",
+        button("Back", () => void dismissResult(), "rl-btn"),
+        canRetry
+          ? button(
+              activity.action === "approve" ? "Review again" : "Retry",
+              () =>
+                void (activity.action === "approve"
+                  ? dismissResult()
+                  : runApproval(activity.action, activity.requestId)),
+              "rl-btn rl-btn--primary",
+            )
+          : undefined,
+      ),
     );
   }
   const approved = activity.status === "approved";
-  return el(
-    "section",
-    "popup-approval popup-progress",
-    el("div", "eyebrow", approved ? "Device approved" : "Request denied"),
-    el(
-      "h2",
-      "",
-      activity.connected
-        ? "Device connected"
-        : approved
-          ? "Finishing secure pairing…"
-          : "Access was not granted",
-    ),
-    el(
-      "p",
-      "popup-approval-copy",
-      approved
+  const mark = el("div", "rl-result-icon", icon(approved ? "check" : "cross"));
+  if (!approved) mark.dataset.tone = "neutral";
+  return result(
+    activity.connected
+      ? "Device connected"
+      : approved
+        ? "Finishing secure pairing…"
+        : "Access was not granted",
+    activity.connected
+      ? "It now has the workspace key and will start syncing."
+      : approved
         ? "Relay is completing authorization in the background."
         : "The pending request has been removed.",
-    ),
+    mark,
   );
 }
 
@@ -135,26 +177,18 @@ function pendingView() {
   if (!request) return undefined;
   selectedId = request.id;
   const position = approvalPosition(state.approvals, request.id);
-  const section = el("section", "popup-approval");
-  section.setAttribute("aria-live", "polite");
-  section.append(
-    el("div", "eyebrow", "New device request"),
-    el(
-      "h2",
-      "",
+  const section = body(
+    heading(
       position.total > 1 ? `Request ${position.index + 1} of ${position.total}` : "New device",
+      `Wants to join your workspace · requested ${ago(request.requestedAt).toLowerCase()}`,
     ),
-    el("p", "popup-request-meta", `Requested ${ago(request.requestedAt).toLowerCase()}`),
   );
+  section.setAttribute("aria-live", "polite");
   if (state.paused) {
     section.append(
-      el(
-        "p",
-        "popup-approval-copy popup-preparing",
-        "Relay is paused. Resume to review this device request.",
-      ),
+      el("p", "rl-text", "Relay is paused. Resume to review this device request."),
       button(
-        "Resume Relay",
+        ["Resume Relay"],
         () => {
           localError = undefined;
           void requests
@@ -163,31 +197,39 @@ function pendingView() {
             .then(prepareCurrentRequest)
             .catch(showError);
         },
-        "secondary compact",
+        "rl-btn rl-btn--primary rl-btn--block",
       ),
     );
     return section;
   }
   if (request.sas) {
-    section.append(
-      el("div", "eyebrow popup-code-label", "Verification code"),
-      el("div", "code popup-code", groupedCode(request.sas)),
-      el("p", "popup-approval-copy", "Make sure this matches the code shown on the other device."),
+    const deny = button(
+      "Deny",
+      () => void runApproval("deny", request.id),
+      "rl-btn rl-btn--danger",
     );
-    const deny = button("Deny", () => void runApproval("deny", request.id), "danger compact");
     const approve = button(
       "Approve",
       () => void runApproval("approve", request.id),
-      "primary compact",
+      "rl-btn rl-btn--primary",
     );
     deny.disabled = !!localAction;
     approve.disabled = !!localAction;
-    section.append(el("div", "popup-approval-actions", deny, approve));
+    section.append(
+      el(
+        "div",
+        "rl-code-well",
+        el("span", "rl-caption", "Verification code"),
+        el("span", "rl-code", groupedCode(request.sas)),
+      ),
+      el("p", "rl-text", "Approve only if this matches the code shown on the new device."),
+      el("div", "rl-actions rl-actions--fill", deny, approve),
+    );
   } else {
     section.append(
       el(
         "p",
-        "popup-approval-copy popup-preparing",
+        "rl-text",
         request.reviewing
           ? request.ours
             ? "Preparing the verification code… Keep both devices open."
@@ -196,8 +238,8 @@ function pendingView() {
       ),
       el(
         "div",
-        "popup-approval-actions",
-        button("Deny", () => void runApproval("deny", request.id), "danger compact"),
+        "rl-actions",
+        button("Deny", () => void runApproval("deny", request.id), "rl-btn rl-btn--danger"),
       ),
     );
   }
@@ -205,85 +247,208 @@ function pendingView() {
     section.append(
       el(
         "nav",
-        "popup-request-nav",
-        button("← Previous", () => navigate(-1), "ghost compact"),
-        button("Next →", () => navigate(1), "ghost compact"),
+        "rl-request-nav",
+        button([icon("back"), "Previous"], () => navigate(-1), "rl-btn rl-btn--ghost rl-btn--sm"),
+        button(["Next", icon("next")], () => navigate(1), "rl-btn rl-btn--ghost rl-btn--sm"),
       ),
     );
   return section;
 }
 
+function setupView() {
+  const welcome = state.phase === "welcome";
+  const copy =
+    state.phase === "pending"
+      ? "Approve it from one of your other devices, then compare the code on the setup page."
+      : state.phase === "merge"
+        ? "Your Relay workspace is ready to merge with the tabs open here."
+        : state.phase === "draft"
+          ? "Save your recovery key, then start syncing."
+          : "Tabs, windows, and groups, end‑to‑end encrypted. No email. No password.";
+  return body(
+    el(
+      "div",
+      "rl-workspace",
+      el(
+        "h2",
+        "rl-title rl-title--sm",
+        welcome ? "Sync this browser with your others" : "Finish setting up this device",
+      ),
+      el("p", "rl-small", copy),
+    ),
+    button(
+      welcome ? "Set up Relay" : "Continue setup",
+      () => void chrome.runtime.openOptionsPage(),
+      "rl-btn rl-btn--primary rl-btn--block",
+    ),
+  );
+}
+
+function deviceMeta(device: Status["devices"][number], live: boolean) {
+  if (device.id === state.device) return "This device";
+  // Presence is only current while connected; otherwise show when it was last seen.
+  if (device.online && live) return "Online";
+  return device.lastSeen ? ago(device.lastSeen).replace(/^Just now$/, "just now") : "Offline";
+}
+
+function workspaceView() {
+  const live = state.status === "Live" && !state.paused;
+  const queued = state.queue;
+  const workspace = el(
+    "div",
+    "rl-workspace",
+    el("span", "rl-caption", "Main workspace"),
+    el(
+      "p",
+      "rl-count",
+      `${countLabel(state.workspace?.windows ?? 0, "window")} · ${countLabel(state.workspace?.tabs ?? 0, "tab")}`,
+    ),
+    el(
+      "p",
+      "rl-meta",
+      live && queued
+        ? `Syncing ${countLabel(queued, "change")}…`
+        : syncedLabel(state.lastSynced, live),
+      el("span", "rl-meta-sep", "·"),
+      icon("lock"),
+      "End-to-end encrypted",
+    ),
+  );
+  const section = body(workspace);
+  if (queued && !live)
+    section.append(
+      el(
+        "div",
+        "rl-notice",
+        icon("download"),
+        el(
+          "span",
+          "",
+          state.paused
+            ? `${countLabel(queued, "change")} waiting. ${queued === 1 ? "It’ll" : "They’ll"} sync when you resume.`
+            : `${countLabel(queued, "change")} saved on this device. ${queued === 1 ? "It’ll" : "They’ll"} sync when Relay reconnects.`,
+        ),
+      ),
+    );
+  if (state.devices.length) {
+    const online = state.devices.filter((device) => device.online).length;
+    const list = el(
+      "div",
+      "rl-devices",
+      el(
+        "div",
+        "rl-devices-head",
+        el("span", "", "Devices"),
+        el("span", "", live ? `${online} of ${state.devices.length} online` : "Last known"),
+      ),
+    );
+    const ordered = [...state.devices].sort(
+      (a, b) =>
+        Number(b.id === state.device) - Number(a.id === state.device) ||
+        Number(!!b.online) - Number(!!a.online),
+    );
+    for (const device of ordered.slice(0, MAX_DEVICES)) {
+      const isThis = device.id === state.device;
+      const onlineNow = isThis || (live && !!device.online);
+      const dot = el("span", "rl-dot");
+      dot.dataset.state = onlineNow ? "online" : "offline";
+      const row = el(
+        "div",
+        "rl-device",
+        el("span", "rl-dot-slot", dot),
+        el("span", "rl-device-name", device.name),
+        el("span", "rl-device-meta", deviceMeta(device, live)),
+      );
+      row.dataset.state = onlineNow ? "online" : "offline";
+      list.append(row);
+    }
+    if (ordered.length > MAX_DEVICES)
+      list.append(
+        el(
+          "div",
+          "rl-devices-head",
+          el("span", "", `${ordered.length - MAX_DEVICES} more in Settings`),
+        ),
+      );
+    section.append(list);
+  }
+  return section;
+}
+
+function pauseControl() {
+  const control = state.paused
+    ? button(
+        [icon("play"), "Resume Relay"],
+        () => void call("pause", { value: false }).then(update).catch(showError),
+        "rl-btn rl-btn--primary rl-btn--sm",
+      )
+    : button(
+        [icon("pause"), "Pause"],
+        () => void call("pause", { value: true }).then(update).catch(showError),
+        "rl-btn rl-btn--ghost rl-btn--sm",
+      );
+  control.setAttribute("aria-label", state.paused ? "Resume Relay" : "Pause Relay");
+  return control;
+}
+
+function headerLabel(attention: boolean) {
+  if (attention) return "Needs attention";
+  if (state.phase === "welcome") return "Not set up";
+  if (state.phase === "pending") return "Waiting for approval";
+  if (state.phase !== "active") return "Setup";
+  if (state.status === "Live" && state.queue) return "Syncing";
+  return state.status;
+}
+
 function render() {
   if (!app) return;
   clearTimeout(resultTimer);
+  const popup = el("div", "rl-popup");
   if (!state) {
-    app.replaceChildren(
-      approvalHeader("Not connected"),
-      errorMessage(localError ?? "Relay background worker is unavailable."),
-      el(
-        "nav",
-        "popup-actions",
-        button("Retry", () => void load(), "secondary compact"),
-        settingsControl(),
+    popup.append(
+      header("Not connected"),
+      body(
+        alertMessage(localError ?? "Relay background worker is unavailable."),
+        el(
+          "div",
+          "rl-actions",
+          button("Retry", () => void load(), "rl-btn rl-btn--primary rl-btn--sm"),
+        ),
       ),
-      footer(),
+      footer(settingsControl()),
     );
+    app.replaceChildren(popup);
     return;
   }
   const actionResult = resultView();
   const failure =
     state.approvalActivity?.status === "failed" ? undefined : localError || state.error;
   const approval = actionResult ?? pendingView();
-  app.replaceChildren(approvalHeader(approval || failure ? "Needs attention" : state.status));
-  if (failure) app.append(errorMessage(failure));
+  popup.append(header(headerLabel(!!(approval || failure))));
   if (approval) {
-    app.append(approval, settingsControl(), footer());
+    if (failure) approval.prepend(alertMessage(failure));
+    popup.append(approval, footer(settingsControl()));
+    enter(
+      popup,
+      actionResult
+        ? `result:${state.approvalActivity?.status ?? localAction}`
+        : `request:${selectedId}`,
+    );
+    app.replaceChildren(popup);
     scheduleResultDismissal();
     return;
   }
   if (state.phase !== "active") {
-    app.append(
-      el("h2", "popup-title", "Your workspace, everywhere."),
-      el("p", "", "End-to-end encrypted. No email. No password."),
-      button("Set up Relay", () => void chrome.runtime.openOptionsPage(), "primary"),
-    );
+    const view = setupView();
+    if (failure) view.prepend(alertMessage(failure));
+    popup.append(view, footer(settingsControl()));
   } else {
-    app.append(
-      el(
-        "section",
-        "popup-workspace",
-        el("div", "eyebrow", "Main workspace"),
-        el(
-          "p",
-          "metric",
-          `${countLabel(state.workspace?.windows ?? 0, "window")} · ${countLabel(state.workspace?.tabs ?? 0, "tab")}`,
-        ),
-        el(
-          "p",
-          "popup-meta",
-          `${countLabel(state.devices.filter((device) => device.online).length, "device")} connected · ${countLabel(state.queue, "change")} queued`,
-        ),
-        el("small", "", `Last synced ${ago(state.lastSynced)}`),
-      ),
-      el(
-        "nav",
-        "popup-actions",
-        button(
-          state.paused ? "Resume Relay" : "Pause Relay",
-          () => void call("pause", { value: !state.paused }).then(update).catch(showError),
-          "secondary compact",
-        ),
-        settingsControl(),
-      ),
-      el(
-        "div",
-        "popup-account",
-        el("span", "", "Account"),
-        el("small", "", state.account ? masked(state.account) : ""),
-      ),
-    );
+    const view = workspaceView();
+    if (failure) view.prepend(alertMessage(failure));
+    popup.append(view, footer(pauseControl(), settingsControl()));
   }
-  app.append(footer());
+  enter(popup, state.phase === "active" ? "workspace" : `setup:${state.phase}`);
+  app.replaceChildren(popup);
 }
 
 function update(next: Status) {

@@ -121,7 +121,8 @@ for (const page of ["popup", "settings"]) {
     template.replaceAll("__PAGE__", page).replaceAll("__RELAY_BUILD__", relayBuild),
   );
 }
-// Rasterize the original two-link Relay mark without an image/runtime dependency.
+// Rasterize the Relay mark (two overlapping windows on a blue tile) without an
+// image/runtime dependency. Geometry matches the SVG mark in apps/extension/src/ui.ts.
 function crc32(data) {
   let crc = 0xffffffff;
   for (const byte of data) {
@@ -138,20 +139,41 @@ function chunk(type, data) {
   crc.writeUInt32BE(crc32(Buffer.concat([name, data])));
   return Buffer.concat([length, name, data, crc]);
 }
+function insideRoundRect(px, py, x0, y0, x1, y1, r) {
+  if (px < x0 || px > x1 || py < y0 || py > y1) return false;
+  const cx = Math.min(Math.max(px, x0 + r), x1 - r);
+  const cy = Math.min(Math.max(py, y0 + r), y1 - r);
+  return (px - cx) ** 2 + (py - cy) ** 2 <= r * r;
+}
 for (const size of [16, 32, 48, 128]) {
   const data = Buffer.alloc(size * (size * 4 + 1));
+  const samples = 4;
   for (let y = 0; y < size; y++)
     for (let x = 0; x < size; x++) {
-      const u = x / size;
-      const v = y / size;
-      const upper =
-        (u > 0.2 && u < 0.8 && v > 0.23 && v < 0.39) ||
-        (u > 0.64 && u < 0.8 && v > 0.23 && v < 0.56);
-      const lower =
-        (u > 0.2 && u < 0.8 && v > 0.61 && v < 0.77) ||
-        (u > 0.2 && u < 0.36 && v > 0.44 && v < 0.77);
+      let tile = 0;
+      let glyph = 0;
+      for (let sy = 0; sy < samples; sy++)
+        for (let sx = 0; sx < samples; sx++) {
+          const u = ((x + (sx + 0.5) / samples) / size) * 256;
+          const v = ((y + (sy + 0.5) / samples) / size) * 256;
+          if (!insideRoundRect(u, v, 0, 0, 256, 256, 67)) continue;
+          tile++;
+          const a = insideRoundRect(u, v, 51, 51, 167, 167, 29);
+          const b = insideRoundRect(u, v, 89, 89, 205, 205, 29);
+          if (a !== b) glyph++;
+        }
+      const total = samples * samples;
+      const mix = tile ? glyph / tile : 0;
       const p = y * (size * 4 + 1) + 1 + x * 4;
-      data.set(upper || lower ? [162, 180, 255, 255] : [13, 16, 32, 255], p);
+      data.set(
+        [
+          Math.round(54 + (251 - 54) * mix),
+          Math.round(83 + (252 - 83) * mix),
+          Math.round(220 + (255 - 220) * mix),
+          Math.round((tile / total) * 255),
+        ],
+        p,
+      );
     }
   const header = Buffer.alloc(13);
   header.writeUInt32BE(size);
