@@ -10,30 +10,32 @@ Relay is an open-source browser extension and Cloudflare backend that keeps tabs
 
 Relay releases are distributed as unpacked Chromium extensions. To install, download and extract the ZIP, open `helium://extensions` or `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select the extracted folder containing `manifest.json`.
 
-## Demo
-
-Account creation, device setup, and live synchronization in action:
-
-https://github.com/user-attachments/assets/892100c9-1324-4502-83f7-7dbcdd6c6a55
+## Screenshots
 
 <p align="center">
-  <img src="docs/assets/relay-settings.png" alt="Relay settings showing a live synchronized workspace" width="900">
+  <img src="docs/assets/relay-settings.png" alt="Relay settings on the Devices page, listing three devices with rename and revoke controls" width="900">
 </p>
 
 <table>
   <tr>
     <td width="72%">
-      <img src="docs/assets/relay-onboarding.png" alt="Relay account creation screen">
+      <img src="docs/assets/relay-onboarding.png" alt="Relay setup screen with a device name field and Create Relay account button">
     </td>
     <td width="28%">
-      <img src="docs/assets/relay-popup.png" alt="Relay popup showing a live workspace with two connected devices">
+      <img src="docs/assets/relay-popup.png" alt="Relay popup showing a live workspace with two of three devices online">
     </td>
   </tr>
   <tr>
-    <td align="center"><strong>Private, passwordless onboarding</strong></td>
+    <td align="center"><strong>Private, passwordless setup</strong></td>
     <td align="center"><strong>Sync status at a glance</strong></td>
   </tr>
 </table>
+
+<p align="center">
+  <img src="docs/assets/relay-settings-light.png" alt="Relay synchronization settings in the light theme" width="900">
+  <br>
+  <strong>Follows your browser's light or dark theme</strong>
+</p>
 
 ## Why Relay exists
 
@@ -206,7 +208,7 @@ See [self-hosting](docs/SELF-HOSTING.md) for Cloudflare deployment and custom Wo
 
 ## Project status
 
-Relay is functional pre-release software (`0.1.0`).
+Relay is functional pre-release software (`0.1.1`).
 
 It has **not** received an independent security review and has not been released on the Chrome Web Store. The current implementation is a single-account device synchronization system in which authorized devices are equally privileged.
 
