@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { serverOrigin } from "@relay/shared";
-import { formatRelayBuild } from "./build-info";
+import { displayBuildId } from "./build-info";
 import type { Status } from "./controller";
 import { watchStatus } from "./status-channel";
 import { statusViewKey } from "./status-view";
 import {
   ago,
+  alertMessage,
   brand,
   button,
   call,
@@ -13,10 +14,15 @@ import {
   el,
   grouped,
   groupedCode,
+  type IconName,
+  icon,
   input,
+  mark,
   masked,
   statusBadge,
   switchControl,
+  syncedLabel,
+  toneFor,
 } from "./ui";
 
 declare const __DEV__: boolean;
@@ -33,6 +39,9 @@ let refreshing = false;
 let lastAttention = "";
 let lastContext = "";
 let revealed = false;
+let renaming: string | undefined;
+let renameValue = "";
+let revoking: string | undefined;
 let nameValue = navigator.userAgent.includes("Windows")
   ? "Windows Desktop"
   : navigator.userAgent.includes("Mac")
@@ -40,28 +49,27 @@ let nameValue = navigator.userAgent.includes("Windows")
     : "Linux Desktop";
 let serverValue = "";
 let accountValue = "";
+
+function errorTarget() {
+  return app?.querySelector<HTMLElement>("[data-error-target]") ?? app;
+}
+
 function report(error: unknown) {
-  const old = document.getElementById("error");
-  old?.remove();
+  document.getElementById("error")?.remove();
   const message = errorMessage(
     error instanceof Error ? error.message : "Relay could not complete this action.",
   );
-  const target = app?.querySelector<HTMLElement>(".onboarding, .grid > .section");
+  const target = app?.querySelector<HTMLElement>("[data-error-target]");
   if (target) target.prepend(message);
   else app?.append(message);
 }
 
 function errorMessage(text: string): HTMLElement {
-  const message = el(
-    "div",
-    "error",
-    el("span", "error-title", "Couldn’t complete that"),
-    el("p", "", text),
-  );
+  const message = alertMessage(text);
   message.id = "error";
-  message.setAttribute("role", "alert");
   return message;
 }
+
 async function perform(action: () => Promise<void>) {
   if (busy) return;
   busy = true;
@@ -87,6 +95,7 @@ async function perform(action: () => Promise<void>) {
     app?.setAttribute("aria-busy", "false");
   }
 }
+
 async function act(action: string, payload: Record<string, unknown> = {}) {
   await perform(async () => {
     state = await call(action, payload);
@@ -94,6 +103,7 @@ async function act(action: string, payload: Record<string, unknown> = {}) {
     render();
   });
 }
+
 function saveRecovery() {
   const blob = new Blob(
     [
@@ -108,371 +118,85 @@ function saveRecovery() {
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-function controls() {
-  const name = input("This device", nameValue);
-  name.field.oninput = () => {
-    nameValue = name.field.value;
-  };
-  const server = input("Relay server", serverValue || state.server);
-  server.field.oninput = () => {
-    serverValue = server.field.value;
-  };
-  const detail = el(
-    "details",
-    "server-disclosure",
-    el("summary", "", state.official ? "Server settings" : "Choose a server"),
-    server.wrapper,
-    el(
-      "small",
-      "",
-      state.official
-        ? "Use the official origin or enter your own. Accounts belong to one server."
-        : "No official service is configured in this build. Use a self-hosted server.",
-    ),
+
+function copy(text: string) {
+  void navigator.clipboard.writeText(text).catch(report);
+}
+
+// ─── Building blocks ────────────────────────────────────────────────────
+
+function pageHeader(title: string, description?: string, level: "h1" | "h2" = "h2") {
+  return el(
+    "div",
+    "rl-page-header",
+    el(level, "rl-title", title),
+    description ? el("p", "rl-text", description) : undefined,
   );
-  return el("div", "", name.wrapper, detail);
 }
-async function testConnection() {
-  await perform(async () => {
-    const origin = serverOrigin(serverValue || state.server, true);
-    const granted = await chrome.permissions.request({ origins: [`${origin}/*`] });
-    if (!granted) throw new Error("Server permission was denied. No connection was made.");
-    const result = await call("health", { server: origin });
-    state = await call("status");
-    render();
-    app?.append(el("p", result.ok ? "" : "error", result.message));
-  });
+
+function sectionBlock(label: string | undefined, ...children: (HTMLElement | undefined)[]) {
+  return el(
+    "section",
+    "rl-section",
+    label ? el("h3", "rl-section-label", label) : undefined,
+    ...children,
+  );
 }
-async function withPermission(action: string, payload: Record<string, unknown>) {
-  await perform(async () => {
-    const origin = serverOrigin(serverValue || state.server, __DEV__);
-    const granted = await chrome.permissions.request({ origins: [`${origin}/*`] });
-    if (!granted) throw new Error("Server permission was denied. No connection was made.");
-    state = await call(action, { server: origin, name: nameValue, ...payload });
-    screen = "welcome";
-    render();
-  });
+
+function group(...children: (HTMLElement | undefined)[]) {
+  return el("div", "rl-group", ...children);
 }
+
+function row(title: string, description?: string, ...aside: (HTMLElement | undefined)[]) {
+  return el(
+    "div",
+    "rl-row",
+    el(
+      "div",
+      "rl-row-copy",
+      el("span", "rl-row-title", title),
+      description ? el("span", "rl-row-desc", description) : undefined,
+    ),
+    ...aside,
+  );
+}
+
+function valueRow(title: string, value: string) {
+  return row(title, undefined, el("span", "rl-row-value", value));
+}
+
+function dot(online: boolean) {
+  const light = el("span", "rl-dot");
+  light.dataset.state = online ? "online" : "offline";
+  return el("span", "rl-dot-slot", light);
+}
+
+function checkbox(label: string, onChange: (checked: boolean) => void) {
+  const box = el("input");
+  box.type = "checkbox";
+  box.onchange = () => onChange(box.checked);
+  return el("label", "rl-check", box, el("span", "", label));
+}
+
 function confirmation(
   label: string,
   onConfirm: () => void,
   buttonLabel: string,
-  secondary?: HTMLElement,
+  ...secondary: HTMLElement[]
 ) {
-  const checkbox = el("input");
-  checkbox.type = "checkbox";
-  const submit = button(buttonLabel, onConfirm, "primary");
+  const submit = button(buttonLabel, onConfirm, "rl-btn rl-btn--primary rl-btn--lg");
   submit.disabled = true;
-  checkbox.onchange = () => {
-    submit.disabled = !checkbox.checked;
-  };
-  const actions = el("div", "actions");
-  if (secondary) actions.append(secondary);
-  actions.append(submit);
-  return el("div", "checks", el("label", "check-label", checkbox, el("span", "", label)), actions);
-}
-function onboarding(): HTMLElement {
-  const welcome = state.phase === "welcome" && screen === "welcome";
-  const body = el(
+  const check = checkbox(label, (checked) => {
+    submit.disabled = !checked;
+  });
+  return el(
     "div",
-    `onboarding section ${welcome ? "onboarding-welcome" : "onboarding-flow"}`,
+    "rl-section",
+    check,
+    el("div", "rl-actions rl-actions--split", submit, ...secondary),
   );
-  if (state.phase === "draft" && state.recovery) {
-    body.append(
-      el("div", "eyebrow", "01 — Keep your recovery information"),
-      el("h1", "", "Your Relay account"),
-      el("div", "secret", grouped(state.account ?? "")),
-      el(
-        "p",
-        "divider",
-        "Use this number when adding another device. It is not your encryption key.",
-      ),
-      button(
-        "Copy account number",
-        () => void navigator.clipboard.writeText(state.account ?? "").catch(report),
-      ),
-      el("h2", "divider", "Save your recovery key"),
-      el(
-        "p",
-        "",
-        "It can authorize a device when none of your other devices are available. Relay cannot recover this key.",
-      ),
-    );
-    if (revealed) body.append(el("div", "secret small", state.recovery));
-    body.append(
-      el(
-        "div",
-        "actions",
-        button(revealed ? "Hide recovery key" : "Reveal recovery key", () => {
-          revealed = !revealed;
-          render();
-        }),
-        button(
-          "Copy key",
-          () => void navigator.clipboard.writeText(state.recovery ?? "").catch(report),
-        ),
-        button("Save recovery information", saveRecovery),
-      ),
-      el("h2", "divider", "Current workspace"),
-      el(
-        "p",
-        "",
-        `${countLabel(state.stats.windows, "window")} · ${countLabel(state.stats.tabs, "syncable tab")} · ${countLabel(state.stats.local, "local-only tab")}`,
-      ),
-      confirmation(
-        "I saved my recovery key and want to sync this workspace.",
-        () => void act("start"),
-        "Start syncing",
-      ),
-    );
-    body.append(button("Cancel setup", () => void act("cancel")));
-  } else if (state.phase === "pending" && screen !== "recover") {
-    const code = state.pair?.sas;
-    body.append(
-      el("div", "eyebrow", "02 — Authorize this device"),
-      el("h1", "", "Waiting for approval"),
-      el(
-        "p",
-        "",
-        "On an authorized device, open Relay → Devices → Review. No Relay device available? Keep this page open, or use your recovery key.",
-      ),
-    );
-    if (code)
-      body.append(
-        el("div", "eyebrow", "Verification code"),
-        el("div", "code", groupedCode(code)),
-        el(
-          "p",
-          "",
-          "Compare this code on both devices. If they differ, cancel. Never approve a request you did not start.",
-        ),
-      );
-    if (state.pair?.status === "approved" && code)
-      body.append(
-        confirmation(
-          "The code matches the device I approved.",
-          () => void act("finish-pair", { code }),
-          "Finish authorization",
-        ),
-      );
-    if (state.pair?.status === "expired")
-      body.append(el("p", "error", "This approval request expired. Cancel and start again."));
-    if (state.pair?.status === "denied")
-      body.append(el("p", "error", "This request was denied. Cancel to try again."));
-    body.append(
-      el(
-        "div",
-        "actions",
-        button("Use recovery key", () => {
-          screen = "recover";
-          render();
-        }),
-        button("Cancel", () => void act("cancel")),
-      ),
-    );
-  } else if (state.phase === "merge") {
-    body.append(
-      el("div", "eyebrow", "03 — Bring your workspace together"),
-      el("h1", "", "Relay workspace ready"),
-      el(
-        "p",
-        "",
-        `From Relay: ${countLabel(state.workspace?.windows ?? 0, "window")} · ${countLabel(state.workspace?.tabs ?? 0, "tab")}`,
-      ),
-      el(
-        "p",
-        "",
-        `Already open here: ${countLabel(state.stats.windows, "window")} · ${countLabel(state.stats.tabs, "syncable tab")}`,
-      ),
-      el(
-        "p",
-        "",
-        "Your existing tabs will be merged into Relay. Nothing already open here will be deleted.",
-      ),
-      button("Merge and continue", () => void act("merge"), "primary"),
-    );
-  } else if (screen === "join" || screen === "recover") {
-    body.append(
-      el("div", "eyebrow", screen === "join" ? "Already use Relay" : "Recovery"),
-      el("h1", "", screen === "join" ? "Enter your account number" : "Use your recovery key"),
-    );
-    const account = input("24-digit account number", state.account ?? accountValue);
-    account.field.className = "account-field";
-    account.field.inputMode = "numeric";
-    account.field.oninput = () => {
-      accountValue = account.field.value;
-    };
-    body.append(account.wrapper, controls());
-    if (screen === "recover") {
-      const code = input("Recovery key", "", "password");
-      code.field.className = "recovery-field";
-      body.append(
-        code.wrapper,
-        el("p", "", "Your key is decrypted on this device. It is never sent to the server."),
-        button(
-          "Recover account",
-          () =>
-            void withPermission("recover", {
-              account: account.field.value,
-              code: code.field.value,
-            }),
-          "primary",
-        ),
-      );
-    } else
-      body.append(
-        el(
-          "div",
-          "actions",
-          button(
-            "Request approval",
-            () => void withPermission("join", { account: account.field.value }),
-            "primary",
-          ),
-          button("Use recovery key", () => {
-            screen = "recover";
-            render();
-          }),
-        ),
-      );
-    body.append(
-      el(
-        "div",
-        "actions",
-        button("Back", () => {
-          screen = "welcome";
-          render();
-        }),
-      ),
-    );
-    if (state.phase === "draft") body.append(button("Cancel setup", () => void act("cancel")));
-  } else {
-    body.append(
-      el("h1", "", "Your Helium workspace, everywhere."),
-      el(
-        "p",
-        "",
-        "Real-time synchronization between your devices. End-to-end encrypted. No email. No password.",
-      ),
-      controls(),
-      el(
-        "div",
-        "actions onboarding-actions",
-        button("Create Relay account", () => void withPermission("create", {}), "primary"),
-        button("Enter account number", () => {
-          screen = "join";
-          render();
-        }),
-      ),
-    );
-  }
-  return body;
 }
-function devicePanel() {
-  const body = el(
-    "div",
-    "section",
-    el("h2", "", "Devices"),
-    el("p", "section-intro", "Friendly names are end-to-end encrypted."),
-  );
-  for (const pending of state.approvals) {
-    const row = el("div", "banner device-request", el("div", "eyebrow", "New device request"));
-    if (pending.sas) {
-      row.append(
-        el("div", "code", groupedCode(pending.sas)),
-        confirmation(
-          "I started this request and the codes match on both devices.",
-          () => void act("approve", { id: pending.id, code: pending.sas }),
-          "Approve",
-          button("Deny", () => void act("deny", { id: pending.id }), "danger compact"),
-        ),
-      );
-    } else {
-      row.append(
-        el(
-          "p",
-          "",
-          pending.reviewing
-            ? "Waiting for the pairing exchange. Keep both setup pages open."
-            : "Verify the other device before allowing access.",
-        ),
-        el(
-          "div",
-          "actions",
-          ...(!pending.reviewing
-            ? [button("Review", () => void act("review", { id: pending.id }), "secondary compact")]
-            : []),
-          button("Deny", () => void act("deny", { id: pending.id }), "danger compact"),
-        ),
-      );
-    }
-    body.append(row);
-  }
-  for (const device of state.devices) {
-    const row = el(
-      "div",
-      "row device-row",
-      el(
-        "div",
-        "",
-        el("h3", "", device.name),
-        el(
-          "small",
-          "device-meta",
-          device.id === state.device ? "This device · " : "",
-          device.online ? "Online" : `Last seen ${ago(device.lastSeen)}`,
-        ),
-      ),
-    );
-    const actions = el(
-      "div",
-      "actions",
-      button(
-        "Rename",
-        () => {
-          const name = prompt("Device name", device.name);
-          if (name?.trim()) void act("rename", { id: device.id, name });
-        },
-        "ghost compact",
-      ),
-    );
-    if (device.id !== state.device)
-      actions.append(
-        button(
-          "Revoke",
-          () => {
-            if (
-              confirm(
-                `Revoke ${device.name}? Relay will rotate its workspace key. Existing browser tabs will not be closed.`,
-              )
-            )
-              void act("revoke", { id: device.id });
-          },
-          "danger compact",
-        ),
-      );
-    row.append(actions);
-    body.append(row);
-  }
-  return body;
-}
-function preferenceRow(
-  name: string,
-  description: string,
-  key: keyof Status["preferences"],
-  unavailable = false,
-  note?: string,
-) {
-  const copy = el("div", "preference-copy", el("h3", "", name), el("small", "", description));
-  if (note) copy.append(el("small", "preference-note", note));
-  const row = el("div", "row preference-row", copy);
-  row.append(
-    switchControl(name, !!state.preferences[key], unavailable, (checked) => {
-      void act("preferences", { preferences: { [key]: checked } });
-    }),
-  );
-  return row;
-}
+
 function serverPresentation() {
   const hosted = !!state.official && state.server === state.official;
   if (hosted && state.channel === "production")
@@ -495,229 +219,1100 @@ function serverPresentation() {
     description: "This browser profile is connected to a non-production Relay origin.",
   };
 }
-function settings() {
-  const nav = el("nav", "nav");
-  nav.setAttribute("aria-label", "Settings");
-  for (const name of ["General", "Synchronization", "Devices", "Security", "Server", "About"]) {
-    const b = button(name, () => {
-      section = name;
-      render();
-    });
-    if (section === name) b.setAttribute("aria-current", "page");
-    nav.append(b);
-  }
-  let content = el("div", "section", el("h2", "", section));
-  if (section === "General")
-    content.append(
-      statusBadge(state.status),
-      el("h3", "divider", "Main workspace"),
+
+function setupControls() {
+  const name = input("This device", nameValue);
+  name.field.oninput = () => {
+    nameValue = name.field.value;
+  };
+  const device = el(
+    "div",
+    "rl-field",
+    name.wrapper,
+    el(
+      "span",
+      "rl-field-help",
+      "Shown to your other devices. Encrypted before it leaves this browser.",
+    ),
+  );
+  const server = input("Relay server", serverValue || state.server);
+  server.field.oninput = () => {
+    serverValue = server.field.value;
+  };
+  const official = !!state.official && (serverValue || state.server) === state.official;
+  const disclosure = el(
+    "details",
+    "rl-disclosure server-disclosure",
+    el(
+      "summary",
+      "",
+      el("span", "", state.official ? "Server settings" : "Choose a server"),
       el(
-        "p",
-        "metric",
-        `${countLabel(state.workspace?.windows ?? 0, "window")} · ${countLabel(state.workspace?.tabs ?? 0, "tab")}`,
+        "span",
+        "rl-disclosure-meta",
+        official ? "Official Relay service" : serverValue || state.server || "Not set",
+        icon("chevron"),
       ),
+    ),
+    el(
+      "div",
+      "rl-disclosure-body",
+      server.wrapper,
       el(
-        "p",
-        "",
-        `Last synced ${ago(state.lastSynced)} · ${countLabel(state.queue, "local change")} queued`,
+        "span",
+        "rl-field-help",
+        state.official
+          ? "Use the official server or enter your own. Accounts belong to one server."
+          : "No official service is configured in this build. Use a self-hosted server.",
       ),
-      el(
-        "div",
-        "actions",
-        button(
-          state.paused ? "Resume Relay" : "Pause Relay",
-          () => void act("pause", { value: !state.paused }),
-          "primary",
-        ),
-        button("Reconnect", () => void act("retry")),
-      ),
-      el(
-        "p",
-        "",
-        "Active tabs and window positions stay local. Pausing disconnects Relay; workspace changes made while paused are queued for resume.",
-      ),
-    );
-  if (section === "Synchronization")
-    content.append(
-      el(
-        "p",
-        "section-intro",
-        "Choose which workspace changes this device shares with your other Relay devices.",
-      ),
-      el("h3", "section-label", "Tabs"),
-      preferenceRow("New tabs", "Add newly opened tabs to Relay.", "tabCreation"),
-      preferenceRow(
-        "Close tabs",
-        "Close synced tabs on your other devices.",
-        "tabClosure",
-        true,
-        "Coming later: local dismissal needs a durable per-device projection state.",
-      ),
-      preferenceRow("Navigation", "Keep synchronized tabs on the same URL.", "navigation"),
-      el("h3", "section-label divided-label", "Organization"),
-      preferenceRow(
-        "Tab groups",
-        "Sync group names, colors, and tab membership.",
-        "tabGroups",
-        !state.capabilities.tabGroups,
-        !state.capabilities.tabGroups
-          ? "This browser does not expose the required tab-group APIs."
-          : undefined,
-      ),
-      preferenceRow("Pinned tabs", "Keep pinned and unpinned state synchronized.", "pinnedTabs"),
-      preferenceRow(
-        "Multiple windows",
-        "Recreate Relay's separate browser windows on this device.",
-        "multipleWindows",
-        true,
-        "Coming later: flattening is deferred to protect window lifecycle reconciliation.",
-      ),
-      el(
-        "div",
-        "sync-boundaries",
-        el(
-          "div",
-          "",
-          el("h3", "", "Always stays local"),
-          el("p", "", "Active tab, window focus, window size and position, group collapsed state."),
-        ),
-        el(
-          "div",
-          "",
-          el("h3", "", "Never synchronized"),
-          el("p", "", "Incognito, local files, and protected browser pages."),
-        ),
-      ),
-    );
-  if (section === "Devices") content = devicePanel();
-  if (section === "Security") {
-    content.append(
-      el("h3", "divider", "Account number"),
-      el(
-        "div",
-        "secret account-number",
-        revealed ? grouped(state.account ?? "") : masked(state.account ?? ""),
-      ),
-      el(
-        "div",
-        "actions",
-        button(revealed ? "Hide" : "Reveal", () => {
+    ),
+  );
+  return { device, disclosure };
+}
+
+async function testConnection() {
+  await perform(async () => {
+    const origin = serverOrigin(serverValue || state.server, true);
+    const granted = await chrome.permissions.request({ origins: [`${origin}/*`] });
+    if (!granted) throw new Error("Server permission was denied. No connection was made.");
+    const result = await call("health", { server: origin });
+    state = await call("status");
+    render();
+    errorTarget()?.append(el("p", result.ok ? "rl-inline-ok" : "rl-inline-error", result.message));
+  });
+}
+
+async function withPermission(action: string, payload: Record<string, unknown>) {
+  await perform(async () => {
+    const origin = serverOrigin(serverValue || state.server, __DEV__);
+    const granted = await chrome.permissions.request({ origins: [`${origin}/*`] });
+    if (!granted) throw new Error("Server permission was denied. No connection was made.");
+    state = await call(action, { server: origin, name: nameValue, ...payload });
+    screen = "welcome";
+    render();
+  });
+}
+
+// ─── Setup ──────────────────────────────────────────────────────────────
+
+function setupLabel() {
+  if (state.phase === "draft" && state.recovery) return "Setup · New account";
+  if (state.phase === "pending" || state.phase === "merge" || screen === "join")
+    return "Setup · Join";
+  if (screen === "recover") return "Setup · Recovery";
+  return "Setup";
+}
+
+function heading(title: string, lede?: string, large = false) {
+  return el(
+    "div",
+    "rl-setup-heading",
+    el("h1", `rl-title${large ? " rl-title--xl" : ""}`, title),
+    lede ? el("p", "rl-lede", lede) : undefined,
+  );
+}
+
+function backButton(onClick: () => void) {
+  return button([icon("back"), "Back"], onClick, "rl-back");
+}
+
+function draftView(column: HTMLElement) {
+  const accountHead = el(
+    "div",
+    "rl-row-head rl-row-head--flush",
+    el("span", "rl-section-label", "Account number"),
+    button("Copy account number", () => copy(state.account ?? ""), "rl-btn rl-btn--sm"),
+  );
+  const recoveryHead = el(
+    "div",
+    "rl-row-head rl-row-head--flush",
+    el("span", "rl-section-label", "Recovery key"),
+    el(
+      "div",
+      "rl-row-actions",
+      button(
+        revealed ? "Hide recovery key" : "Reveal recovery key",
+        () => {
           revealed = !revealed;
           render();
-        }),
-        button(
-          "Copy account number",
-          () => void navigator.clipboard.writeText(state.account ?? "").catch(report),
+        },
+        "rl-btn rl-btn--sm",
+      ),
+      button("Copy key", () => copy(state.recovery ?? ""), "rl-btn rl-btn--sm"),
+    ),
+  );
+  column.append(
+    heading(
+      "Your Relay account",
+      "Save your recovery key before you start. It can authorize a new device when none of your others are available, and Relay can’t recover it for you.",
+    ),
+    group(
+      el(
+        "div",
+        "rl-group-pad",
+        accountHead,
+        el("div", "rl-secret", grouped(state.account ?? "")),
+        el(
+          "span",
+          "rl-field-help",
+          "Enter this on another device to join. It isn’t your encryption key.",
         ),
       ),
-      el("h3", "divider", "Encrypted on your device"),
       el(
-        "p",
-        "",
-        `AES-256-GCM protects workspace contents. Current key epoch: ${state.epoch}. Revoking a device changes the workspace key for future data.`,
+        "div",
+        "rl-group-pad",
+        recoveryHead,
+        revealed
+          ? el("div", "rl-secret rl-secret--key", state.recovery ?? "")
+          : el("div", "rl-secret--hidden", "•••••• •••••• •••••• •••••• ••••••"),
+        el(
+          "div",
+          "rl-actions",
+          button([icon("download"), "Save recovery information"], saveRecovery, "rl-link"),
+          el("span", "rl-caption", "relay-recovery.txt"),
+        ),
       ),
-      el("h3", "divider", "Recovery"),
+    ),
+    el(
+      "p",
+      "rl-meta",
+      icon("window"),
+      `This browser: ${countLabel(state.stats.windows, "window")} · ${countLabel(state.stats.tabs, "syncable tab")} · ${countLabel(state.stats.local, "local-only tab")}`,
+    ),
+    confirmation(
+      "I saved my recovery key and want to sync this workspace.",
+      () => void act("start"),
+      "Start syncing",
+      button("Cancel setup", () => void act("cancel"), "rl-btn rl-btn--ghost"),
+    ),
+  );
+}
+
+function pendingView(column: HTMLElement) {
+  const code = state.pair?.sas;
+  const pairStatus = state.pair?.status;
+  const minutes = state.pair?.expires
+    ? Math.max(0, Math.ceil((state.pair.expires - Date.now()) / 60_000))
+    : 0;
+  const approved = pairStatus === "approved";
+  const [statusLabel, lightTone] =
+    pairStatus === "expired"
+      ? (["Request expired", "offline"] as const)
+      : pairStatus === "denied"
+        ? (["Request denied", "offline"] as const)
+        : approved
+          ? (["Approved on another device", "live"] as const)
+          : (["Waiting for approval", "attention"] as const);
+  const head = el(
+    "div",
+    "rl-row-head",
+    el("div", "", statusBadge(statusLabel, lightTone)),
+    pairStatus === "pending" || approved
+      ? el("span", "rl-caption", `Expires in ${countLabel(minutes, "min", "min")}`)
+      : undefined,
+  );
+  const approvalGroup = group(head);
+  if (code)
+    approvalGroup.append(
       el(
-        "p",
-        "",
-        "Use the recovery information you saved during setup. Relay cannot retrieve it. Recovery key replacement is not available in this early Relay build.",
-      ),
-    );
-  }
-  if (section === "Server") {
-    const service = serverPresentation();
-    content.append(
-      el("h3", "divider", service.name),
-      el("p", "server-kind", service.description),
-      el("p", "server-origin", state.server),
-      statusBadge(state.status),
-      el(
-        "p",
-        "divider",
-        "Accounts and encrypted workspaces belong to one server. Changing servers is not an account migration. Use a separate browser profile for another server; this build locks the origin after setup to avoid mixing account state.",
-      ),
-    );
-  }
-  if (section === "About") {
-    content.append(
-      brand(),
-      el("p", "about-version", formatRelayBuild(__PRODUCT_VERSION__, __BUILD_ID__)),
-      el(
-        "p",
-        "about-lede",
-        "Private workspace synchronization for Helium and compatible Chromium browsers.",
-      ),
-      el(
-        "p",
-        "",
-        "Relay keeps your tabs, windows, groups, and navigation synchronized across your devices with end-to-end encryption.",
-      ),
-      el("h3", "section-label divided-label", "Privacy"),
-      el(
-        "p",
-        "",
-        "Your workspace is encrypted on your devices before it reaches Relay. The Relay service cannot read synchronized URLs, tab-group titles, device names, or workspace contents. Webpage titles are not collected.",
-      ),
-      el("h3", "section-label divided-label", "Open source"),
-      el("p", "", "AGPL-3.0-or-later"),
-    );
-    const link = el("a", "source-link", "View source on GitHub ↗");
-    link.href = __REPOSITORY_URL__;
-    link.target = "_blank";
-    link.rel = "noreferrer";
-    content.append(
-      link,
-      el("h3", "section-label divided-label", "Compatibility"),
-      el("p", "", "Built for Helium. Works with compatible Chromium browsers."),
-      el("h3", "section-label divided-label", "Disclaimer"),
-      el(
-        "p",
-        "",
-        "Relay is an independent project and is not affiliated with or endorsed by Helium.",
-      ),
-    );
-  }
-  if (__DEV__ && section === "General") {
-    const development = el(
-      "details",
-      "development",
-      el("summary", "", "Development"),
-      el("h3", "", "Connection diagnostics"),
-      el(
-        "p",
-        "",
-        "Inspect the local server connection and development-only synchronization details.",
-      ),
-      button("Test connection", () => void testConnection(), "secondary compact"),
-    );
-    if (state.diagnostics)
-      development.append(
+        "div",
+        "rl-code-well rl-code-well--flat",
+        el("span", "rl-caption", "Verification code"),
+        el("span", "rl-code rl-code--lg", groupedCode(code)),
         el(
           "p",
-          "development-meta",
-          `${state.diagnostics.operations} local operations · ${state.diagnostics.reconnects} connections · ${state.diagnostics.snapshotBytes} snapshot bytes · revision ${state.revision}`,
+          "rl-small",
+          "Compare this code on both devices. If they differ, cancel. Never approve a request you did not start.",
         ),
-      );
-    if (state.startTrace?.length) development.append(el("pre", "", state.startTrace.join("\n")));
-    if (state.runtime || state.behavior) {
-      const diagnostics = JSON.stringify(
-        { runtime: state.runtime, behavior: state.behavior },
-        null,
-        2,
-      );
-      development.append(
-        button(
-          "Copy diagnostics",
-          () => void navigator.clipboard.writeText(diagnostics).catch(report),
-          "secondary compact",
+      ),
+    );
+  else if (pairStatus === "pending")
+    approvalGroup.append(
+      el(
+        "div",
+        "rl-group-pad",
+        el(
+          "p",
+          "rl-small",
+          "No Relay device available? Keep this page open, or use your recovery key.",
         ),
-        el("pre", "", diagnostics),
-      );
-    }
-    content.append(development);
+      ),
+    );
+  if (pairStatus === "expired")
+    approvalGroup.append(
+      el(
+        "div",
+        "rl-group-pad",
+        el("p", "rl-inline-error", "This approval request expired. Cancel and start again."),
+      ),
+    );
+  if (pairStatus === "denied")
+    approvalGroup.append(
+      el(
+        "div",
+        "rl-group-pad",
+        el("p", "rl-inline-error", "This request was denied. Cancel to try again."),
+      ),
+    );
+  const actions = el("div", "rl-actions");
+  if (approved && code) {
+    const submit = button(
+      "Finish authorization",
+      () => void act("finish-pair", { code }),
+      "rl-btn rl-btn--primary rl-btn--lg",
+    );
+    submit.disabled = true;
+    approvalGroup.append(
+      el(
+        "div",
+        "rl-group-pad",
+        checkbox("The code matches the device I approved.", (checked) => {
+          submit.disabled = !checked;
+        }),
+      ),
+    );
+    actions.append(submit);
   }
-  return el("div", "grid", nav, content);
+  actions.append(
+    button(
+      "Use recovery key",
+      () => {
+        screen = "recover";
+        render();
+      },
+      "rl-btn rl-btn--lg",
+    ),
+    button("Cancel", () => void act("cancel"), "rl-btn rl-btn--ghost rl-btn--lg"),
+  );
+  actions.classList.add("rl-actions--split");
+  column.append(
+    heading(
+      "Waiting for approval",
+      "Open Relay on one of your other devices and approve this request. Keep this page open.",
+    ),
+    approvalGroup,
+    actions,
+  );
 }
+
+function mergeView(column: HTMLElement) {
+  const tile = (graphic: Element, tone: "signal" | "neutral") => {
+    const wrap = el("span", "rl-summary-light");
+    wrap.dataset.tone = tone;
+    wrap.append(graphic);
+    return wrap;
+  };
+  column.append(
+    heading(
+      "Relay workspace ready",
+      "Your Relay tabs will open alongside what’s already here. Nothing open on this device is closed.",
+    ),
+    group(
+      el(
+        "div",
+        "rl-summary",
+        tile(mark("rl-mark"), "signal"),
+        el(
+          "div",
+          "rl-summary-copy",
+          el("span", "rl-row-title", "From Relay"),
+          el("span", "rl-row-desc", "Your synced workspace"),
+        ),
+        el(
+          "span",
+          "rl-row-title",
+          `${countLabel(state.workspace?.windows ?? 0, "window")} · ${countLabel(state.workspace?.tabs ?? 0, "tab")}`,
+        ),
+      ),
+      el(
+        "div",
+        "rl-summary",
+        tile(icon("window"), "neutral"),
+        el(
+          "div",
+          "rl-summary-copy",
+          el("span", "rl-row-title", "Already open here"),
+          el("span", "rl-row-desc", "Kept, and added to Relay"),
+        ),
+        el(
+          "span",
+          "rl-row-title",
+          `${countLabel(state.stats.windows, "window")} · ${countLabel(state.stats.tabs, "syncable tab")}`,
+        ),
+      ),
+    ),
+    el(
+      "div",
+      "rl-actions",
+      button("Merge and continue", () => void act("merge"), "rl-btn rl-btn--primary rl-btn--lg"),
+    ),
+  );
+}
+
+function joinView(column: HTMLElement) {
+  const recovering = screen === "recover";
+  const { device, disclosure } = setupControls();
+  const account = input(
+    "24-digit account number",
+    state.account ?? accountValue,
+    "text",
+    "rl-input rl-input--number account-field",
+  );
+  account.field.inputMode = "numeric";
+  account.field.oninput = () => {
+    accountValue = account.field.value;
+  };
+  const fields = el("div", "rl-group-pad", account.wrapper);
+  const actions = el("div", "rl-actions");
+  if (recovering) {
+    const code = input("Recovery key", "", "password", "rl-input recovery-field");
+    fields.append(code.wrapper);
+    actions.append(
+      button(
+        "Recover account",
+        () =>
+          void withPermission("recover", {
+            account: account.field.value,
+            code: code.field.value,
+          }),
+        "rl-btn rl-btn--primary rl-btn--lg",
+      ),
+    );
+  } else
+    actions.append(
+      button(
+        "Request approval",
+        () => void withPermission("join", { account: account.field.value }),
+        "rl-btn rl-btn--primary rl-btn--lg",
+      ),
+      button(
+        "Use recovery key",
+        () => {
+          screen = "recover";
+          render();
+        },
+        "rl-btn rl-btn--lg",
+      ),
+    );
+  if (state.phase === "draft") {
+    actions.classList.add("rl-actions--split");
+    actions.append(
+      button("Cancel setup", () => void act("cancel"), "rl-btn rl-btn--ghost rl-btn--lg"),
+    );
+  }
+  fields.append(device);
+  column.append(
+    backButton(() => {
+      screen = "welcome";
+      render();
+    }),
+    heading(
+      recovering ? "Use your recovery key" : "Enter your account number",
+      recovering
+        ? "For when none of your other devices are available. Your key is decrypted on this device and never sent to the server."
+        : "You’ll find it in Relay → Security on a device you already use. That device will be asked to approve this one.",
+    ),
+    group(fields, disclosure),
+    actions,
+  );
+}
+
+function welcomeView(column: HTMLElement) {
+  const { device, disclosure } = setupControls();
+  column.append(
+    heading(
+      "Your Helium workspace, everywhere.",
+      "Keep tabs, windows, and tab groups in sync across your devices. End‑to‑end encrypted. No email. No password.",
+      true,
+    ),
+    group(el("div", "rl-group-pad", device), disclosure),
+    el(
+      "div",
+      "rl-actions onboarding-actions",
+      button(
+        "Create Relay account",
+        () => void withPermission("create", {}),
+        "rl-btn rl-btn--primary rl-btn--lg",
+      ),
+      button(
+        "Enter account number",
+        () => {
+          screen = "join";
+          render();
+        },
+        "rl-btn rl-btn--lg",
+      ),
+    ),
+  );
+}
+
+function onboarding(): HTMLElement {
+  const column = el("div", "rl-setup-column");
+  column.dataset.errorTarget = "";
+  if (state.phase === "draft" && state.recovery) {
+    column.classList.add("rl-setup-column--wide");
+    draftView(column);
+  } else if (state.phase === "pending" && screen !== "recover") pendingView(column);
+  else if (state.phase === "merge") mergeView(column);
+  else if (screen === "join" || screen === "recover") joinView(column);
+  else welcomeView(column);
+  return el(
+    "div",
+    "rl-setup",
+    el("header", "rl-setup-bar", brand(true), el("span", "rl-small", setupLabel())),
+    el("div", "rl-setup-stage", column),
+    el(
+      "footer",
+      "rl-setup-footer",
+      el(
+        "span",
+        "rl-caption",
+        "Relay is an independent project, not affiliated with or endorsed by Helium.",
+      ),
+      el("span", "rl-caption", "Your active tab and window layout stay yours."),
+    ),
+  );
+}
+
+// ─── Settings pages ─────────────────────────────────────────────────────
+
+function generalPage(column: HTMLElement) {
+  const live = state.status === "Live" && !state.paused;
+  const online = state.devices.filter((device) => device.online).length;
+  const light = el("span", "rl-summary-light", statusBadge("", toneFor(state.status)));
+  light.firstElementChild?.removeAttribute("role");
+  column.append(
+    pageHeader(
+      "General",
+      "Relay keeps this browser’s tabs, windows, and groups in step with your other devices.",
+    ),
+    group(
+      el(
+        "div",
+        "rl-summary",
+        light,
+        el(
+          "div",
+          "rl-summary-copy",
+          el("span", "rl-summary-strong", state.status),
+          el(
+            "span",
+            "rl-small",
+            [
+              syncedLabel(state.lastSynced, live),
+              state.devices.length
+                ? `${online} of ${countLabel(state.devices.length, "device")} online`
+                : undefined,
+            ]
+              .filter(Boolean)
+              .join(" · "),
+          ),
+        ),
+        el(
+          "div",
+          "rl-summary-aside",
+          el(
+            "span",
+            "rl-summary-strong",
+            `${countLabel(state.workspace?.windows ?? 0, "window")} · ${countLabel(state.workspace?.tabs ?? 0, "tab")}`,
+          ),
+          el("span", "rl-small", "Main workspace"),
+        ),
+      ),
+      state.queue
+        ? el(
+            "div",
+            "rl-group-pad",
+            el("span", "rl-small", `${countLabel(state.queue, "local change")} waiting to sync.`),
+          )
+        : undefined,
+    ),
+    sectionBlock(
+      "Sync",
+      group(
+        row(
+          state.paused ? "Relay is paused" : "Pause Relay",
+          state.paused
+            ? "Changes made while paused are kept and sent when you resume."
+            : "Stop sending and receiving changes. Changes made while paused are kept and sent when you resume.",
+          button(
+            state.paused ? "Resume Relay" : "Pause Relay",
+            () => void act("pause", { value: !state.paused }),
+            `rl-btn rl-btn--sm${state.paused ? " rl-btn--primary" : ""}`,
+          ),
+        ),
+        row(
+          "Reconnect",
+          "Open a fresh connection to the Relay server.",
+          button("Reconnect", () => void act("retry"), "rl-btn rl-btn--sm"),
+        ),
+      ),
+    ),
+    el("p", "rl-note", "The active tab and window positions always stay on each device."),
+  );
+  if (__DEV__) column.append(developmentPanel());
+}
+
+function developmentPanel() {
+  const development = el(
+    "details",
+    "rl-dev",
+    el("summary", "", "Development"),
+    el(
+      "div",
+      "rl-section",
+      el(
+        "p",
+        "rl-small",
+        "Inspect the local server connection and development-only synchronization details.",
+      ),
+      el(
+        "div",
+        "rl-actions",
+        button("Test connection", () => void testConnection(), "rl-btn rl-btn--sm"),
+      ),
+    ),
+  );
+  const body = development.lastElementChild as HTMLElement;
+  if (state.diagnostics)
+    body.append(
+      el(
+        "p",
+        "rl-caption",
+        `${state.diagnostics.operations} local operations · ${state.diagnostics.reconnects} connections · ${state.diagnostics.snapshotBytes} snapshot bytes · revision ${state.revision}`,
+      ),
+    );
+  if (state.startTrace?.length) body.append(el("pre", "", state.startTrace.join("\n")));
+  if (state.runtime || state.behavior) {
+    const diagnostics = JSON.stringify(
+      { runtime: state.runtime, behavior: state.behavior },
+      null,
+      2,
+    );
+    body.append(
+      el(
+        "div",
+        "rl-actions",
+        button("Copy diagnostics", () => copy(diagnostics), "rl-btn rl-btn--sm"),
+      ),
+      el("pre", "", diagnostics),
+    );
+  }
+  return development;
+}
+
+function preferenceRow(
+  name: string,
+  description: string,
+  key: keyof Status["preferences"],
+  unavailable = false,
+  note?: string,
+) {
+  const line = row(
+    name,
+    note ? `${description} ${note}` : description,
+    switchControl(name, !!state.preferences[key], unavailable, (checked) => {
+      void act("preferences", { preferences: { [key]: checked } });
+    }),
+  );
+  if (unavailable) line.dataset.disabled = "";
+  return line;
+}
+
+function synchronizationPage(column: HTMLElement) {
+  column.append(
+    pageHeader(
+      "Synchronization",
+      "Choose which changes this device shares with your other Relay devices.",
+    ),
+    sectionBlock(
+      "Tabs",
+      group(
+        preferenceRow("New tabs", "Add newly opened tabs to Relay.", "tabCreation"),
+        preferenceRow(
+          "Close tabs",
+          "Close synced tabs on your other devices.",
+          "tabClosure",
+          true,
+          "Not available yet.",
+        ),
+        preferenceRow("Navigation", "Keep synchronized tabs on the same page.", "navigation"),
+      ),
+    ),
+    sectionBlock(
+      "Organization",
+      group(
+        preferenceRow(
+          "Tab groups",
+          "Sync group names, colors, and tab membership.",
+          "tabGroups",
+          !state.capabilities.tabGroups,
+          !state.capabilities.tabGroups
+            ? "This browser doesn’t provide the tab group APIs Relay needs."
+            : undefined,
+        ),
+        preferenceRow("Pinned tabs", "Keep pinned and unpinned state synchronized.", "pinnedTabs"),
+        preferenceRow(
+          "Multiple windows",
+          "Recreate Relay’s separate windows on this device.",
+          "multipleWindows",
+          true,
+          "Not available yet.",
+        ),
+      ),
+    ),
+    el(
+      "div",
+      "rl-facts",
+      el(
+        "div",
+        "",
+        el("h3", "", "Always stays on this device"),
+        el(
+          "p",
+          "rl-small",
+          "Active tab, window focus, window size and position, collapsed groups.",
+        ),
+      ),
+      el(
+        "div",
+        "",
+        el("h3", "", "Never synchronized"),
+        el("p", "rl-small", "Incognito, local files, and protected browser pages."),
+      ),
+    ),
+  );
+}
+
+function requestGroup(pending: Status["approvals"][number]) {
+  const head = el(
+    "div",
+    "rl-row-head",
+    el("div", "", statusBadge("New device request", "attention")),
+    el("span", "rl-caption", `Requested ${ago(pending.requestedAt).toLowerCase()}`),
+  );
+  head.querySelector(".rl-status")?.setAttribute("role", "presentation");
+  const requestGroupElement = group(head);
+  requestGroupElement.classList.add("rl-group--attention");
+  if (pending.sas) {
+    const code = pending.sas;
+    const approve = button(
+      "Approve",
+      () => void act("approve", { id: pending.id, code }),
+      "rl-btn rl-btn--primary rl-btn--sm",
+    );
+    approve.disabled = true;
+    requestGroupElement.append(
+      el(
+        "div",
+        "rl-code-row",
+        el(
+          "div",
+          "",
+          el("span", "rl-caption", "Verification code"),
+          el("span", "rl-code rl-code--md", groupedCode(code)),
+        ),
+        el(
+          "p",
+          "rl-text",
+          "Compare this code with the one on the new device. Never approve a request you didn’t start.",
+        ),
+      ),
+      el(
+        "div",
+        "rl-row",
+        el(
+          "div",
+          "rl-row-copy",
+          checkbox("I started this request and the codes match on both devices.", (checked) => {
+            approve.disabled = !checked;
+          }),
+        ),
+        el(
+          "div",
+          "rl-row-actions",
+          button(
+            "Deny",
+            () => void act("deny", { id: pending.id }),
+            "rl-btn rl-btn--danger rl-btn--sm",
+          ),
+          approve,
+        ),
+      ),
+    );
+  } else
+    requestGroupElement.append(
+      el(
+        "div",
+        "rl-row",
+        el(
+          "div",
+          "rl-row-copy",
+          el(
+            "span",
+            "rl-row-desc",
+            pending.reviewing
+              ? "Waiting for the pairing exchange. Keep both setup pages open."
+              : "Verify the other device before allowing access.",
+          ),
+        ),
+        el(
+          "div",
+          "rl-row-actions",
+          ...(!pending.reviewing
+            ? [button("Review", () => void act("review", { id: pending.id }), "rl-btn rl-btn--sm")]
+            : []),
+          button(
+            "Deny",
+            () => void act("deny", { id: pending.id }),
+            "rl-btn rl-btn--danger rl-btn--sm",
+          ),
+        ),
+      ),
+    );
+  return requestGroupElement;
+}
+
+function deviceRow(device: Status["devices"][number]) {
+  const isThis = device.id === state.device;
+  const online = isThis || !!device.online;
+  const meta = `${isThis ? "This device · " : ""}${device.online || isThis ? "Online" : device.lastSeen ? `Last seen ${ago(device.lastSeen).toLowerCase()}` : "Offline"}`;
+  if (renaming === device.id) {
+    const field = el("input", "rl-input rl-input--sm");
+    field.value = renameValue;
+    field.setAttribute("aria-label", `New name for ${device.name}`);
+    field.maxLength = 64;
+    const save = () => {
+      const name = field.value.trim();
+      if (!name) return;
+      renaming = undefined;
+      void act("rename", { id: device.id, name });
+    };
+    const cancel = () => {
+      renaming = undefined;
+      render();
+    };
+    field.oninput = () => {
+      renameValue = field.value;
+    };
+    field.onkeydown = (event) => {
+      if (event.key === "Enter") save();
+      if (event.key === "Escape") cancel();
+    };
+    queueMicrotask(() => field.focus());
+    return el(
+      "div",
+      "rl-row device-row",
+      dot(online),
+      el("div", "rl-row-copy", field),
+      el(
+        "div",
+        "rl-row-actions",
+        button("Cancel", cancel, "rl-btn rl-btn--ghost rl-btn--sm"),
+        button("Save", save, "rl-btn rl-btn--primary rl-btn--sm"),
+      ),
+    );
+  }
+  const identity = [
+    dot(online),
+    el(
+      "div",
+      "rl-row-copy",
+      el("span", "rl-row-title", device.name),
+      el("span", "rl-row-desc", meta),
+    ),
+  ];
+  if (revoking === device.id)
+    return el(
+      "div",
+      "rl-row rl-row--confirm device-row",
+      el("div", "rl-confirm-head", ...identity),
+      el(
+        "div",
+        "rl-confirm",
+        el(
+          "p",
+          "rl-small",
+          `Revoke ${device.name}? Relay rotates the workspace key so it can’t read future changes. Tabs already open on it stay open.`,
+        ),
+        el(
+          "div",
+          "rl-row-actions",
+          button(
+            "Cancel",
+            () => {
+              revoking = undefined;
+              render();
+            },
+            "rl-btn rl-btn--sm",
+          ),
+          button(
+            "Revoke device",
+            () => {
+              revoking = undefined;
+              void act("revoke", { id: device.id });
+            },
+            "rl-btn rl-btn--danger-solid rl-btn--sm",
+          ),
+        ),
+      ),
+    );
+  const actions = el(
+    "div",
+    "rl-row-actions",
+    button(
+      "Rename",
+      () => {
+        renaming = device.id;
+        renameValue = device.name;
+        revoking = undefined;
+        render();
+      },
+      "rl-btn rl-btn--ghost rl-btn--sm",
+    ),
+  );
+  const renameButton = actions.firstElementChild;
+  renameButton?.setAttribute("aria-label", `Rename ${device.name}`);
+  if (!isThis)
+    actions.append(
+      button(
+        "Revoke",
+        () => {
+          revoking = device.id;
+          renaming = undefined;
+          render();
+        },
+        "rl-btn rl-btn--ghost rl-btn--danger rl-btn--sm",
+      ),
+    );
+  actions.lastElementChild?.setAttribute(
+    "aria-label",
+    isThis ? `Rename ${device.name}` : `Revoke ${device.name}`,
+  );
+  return el("div", "rl-row device-row", ...identity, actions);
+}
+
+function devicesPage(column: HTMLElement) {
+  column.append(
+    pageHeader(
+      "Devices",
+      "Every device here can read and change your workspace. Device names are end-to-end encrypted.",
+    ),
+  );
+  for (const pending of state.approvals) column.append(requestGroup(pending));
+  const ordered = [...state.devices].sort(
+    (a, b) => Number(b.id === state.device) - Number(a.id === state.device),
+  );
+  column.append(
+    sectionBlock(
+      countLabel(ordered.length, "device"),
+      ordered.length ? group(...ordered.map(deviceRow)) : el("p", "rl-note", "No devices yet."),
+    ),
+  );
+}
+
+function securityPage(column: HTMLElement) {
+  const accountLine = el(
+    "div",
+    "rl-row-head rl-row-head--flush",
+    el(
+      "span",
+      "rl-secret account-number",
+      revealed ? grouped(state.account ?? "") : masked(state.account ?? ""),
+    ),
+    el(
+      "div",
+      "rl-row-actions",
+      button(
+        revealed ? "Hide" : "Reveal",
+        () => {
+          revealed = !revealed;
+          render();
+        },
+        "rl-btn rl-btn--sm",
+      ),
+      button("Copy account number", () => copy(state.account ?? ""), "rl-btn rl-btn--sm"),
+    ),
+  );
+  column.append(
+    pageHeader(
+      "Security",
+      "Your workspace is encrypted on this device before it reaches the Relay server.",
+    ),
+    sectionBlock(
+      "Account number",
+      group(
+        el(
+          "div",
+          "rl-group-pad",
+          accountLine,
+          el(
+            "span",
+            "rl-small",
+            "Enter this on a new device to join. It identifies your account, but it isn’t an encryption key.",
+          ),
+        ),
+      ),
+    ),
+    sectionBlock(
+      "Encryption",
+      group(
+        valueRow("Workspace contents", "AES-256-GCM, encrypted on this device"),
+        row(
+          "Workspace key",
+          "Revoking a device replaces the key for future changes.",
+          el("span", "rl-row-value", `Epoch ${state.epoch ?? "–"}`),
+        ),
+      ),
+    ),
+    sectionBlock(
+      "Recovery",
+      group(
+        el(
+          "div",
+          "rl-group-pad",
+          el(
+            "p",
+            "rl-text",
+            "Use the recovery information you saved during setup to authorize a device when none of your others are available. Relay can’t retrieve it for you.",
+          ),
+          el("p", "rl-small", "Replacing the recovery key isn’t available in this version."),
+        ),
+      ),
+    ),
+  );
+}
+
+function serverPage(column: HTMLElement) {
+  const service = serverPresentation();
+  column.append(
+    pageHeader(
+      "Server",
+      "The Relay server orders and relays encrypted changes between your devices.",
+    ),
+    group(
+      row(service.name, service.description, statusBadge(state.status)),
+      valueRow("Address", state.server),
+    ),
+    el(
+      "div",
+      "rl-facts",
+      el(
+        "div",
+        "",
+        el("h3", "", "One server per account"),
+        el(
+          "p",
+          "rl-small",
+          "Accounts and their encrypted workspaces belong to the server they were created on. Changing servers isn’t a migration. To use another server, set Relay up in a separate browser profile.",
+        ),
+      ),
+    ),
+  );
+}
+
+function aboutPage(column: HTMLElement) {
+  const source = el("a", "rl-btn rl-btn--sm", "View source on GitHub", icon("external"));
+  source.href = __REPOSITORY_URL__;
+  source.target = "_blank";
+  source.rel = "noreferrer";
+  const fact = (title: string, text: string) =>
+    el(
+      "div",
+      "rl-fact-row",
+      el("span", "rl-row-title", title),
+      el("span", "rl-small rl-fact-text", text),
+    );
+  column.append(
+    pageHeader("About", "Private workspace sync for Helium and compatible Chromium browsers."),
+    group(
+      el(
+        "div",
+        "rl-version",
+        mark(),
+        el(
+          "div",
+          "rl-summary-copy",
+          el("span", "rl-summary-strong about-version", `Relay ${__PRODUCT_VERSION__}`),
+          el(
+            "span",
+            "rl-small",
+            `Build ${displayBuildId(__BUILD_ID__)} · Experimental pre-release`,
+          ),
+        ),
+        source,
+      ),
+    ),
+    group(
+      fact(
+        "Privacy",
+        "Your workspace is encrypted on your devices before it reaches Relay. The service can’t read synchronized URLs, tab-group titles, device names, or workspace contents. Page titles aren’t collected.",
+      ),
+      fact("License", "Open source under AGPL-3.0-or-later."),
+      fact("Compatibility", "Built for Helium. Works with compatible Chromium browsers."),
+      fact(
+        "Disclaimer",
+        "Relay is an independent project, not affiliated with or endorsed by Helium.",
+      ),
+    ),
+  );
+}
+
+const pages: [name: string, glyph: IconName, render: (column: HTMLElement) => void][] = [
+  ["General", "general", generalPage],
+  ["Synchronization", "sync", synchronizationPage],
+  ["Devices", "devices", devicesPage],
+  ["Security", "security", securityPage],
+  ["Server", "server", serverPage],
+  ["About", "about", aboutPage],
+];
+
+function settings() {
+  const nav = el("nav", "rl-nav");
+  nav.setAttribute("aria-label", "Settings");
+  for (const [name, glyph] of pages) {
+    const requests = name === "Devices" ? state.approvals.length : 0;
+    const item = button(
+      [
+        icon(glyph),
+        el("span", "rl-nav-label", name),
+        requests ? el("span", "rl-badge", String(requests)) : "",
+      ],
+      () => {
+        section = name;
+        renaming = undefined;
+        revoking = undefined;
+        render();
+      },
+      "rl-nav-item",
+    );
+    if (requests) item.setAttribute("aria-label", `${name}, ${countLabel(requests, "request")}`);
+    if (section === name) item.setAttribute("aria-current", "page");
+    nav.append(item);
+  }
+  const live = state.status === "Live" && !state.paused;
+  const column = el("div", "rl-column");
+  column.dataset.errorTarget = "";
+  const page = pages.find(([name]) => name === section) ?? pages[0];
+  page?.[2](column);
+  return el(
+    "div",
+    "rl-settings",
+    el(
+      "aside",
+      "rl-sidebar",
+      el("div", "rl-sidebar-top", brand(true), nav),
+      el(
+        "div",
+        "rl-sidebar-status",
+        statusBadge(state.status),
+        el("span", "rl-caption", `· ${syncedLabel(state.lastSynced, live).toLowerCase()}`),
+      ),
+    ),
+    el("div", "rl-content", column),
+  );
+}
+
 function attentionKey(value: Status) {
   return JSON.stringify([
     value.phase,
@@ -732,6 +1327,7 @@ function attentionKey(value: Status) {
     value.preferences,
   ]);
 }
+
 function render() {
   if (!app) return;
   // A join/recovery draft has no newly generated recovery key. Keep it retryable,
@@ -744,33 +1340,20 @@ function render() {
       ? app.querySelector<HTMLInputElement>(".recovery-field")?.value
       : undefined;
   if (context !== lastContext) revealed = false;
-  app.className = "shell";
-  app.classList.toggle("onboarding-shell", state.phase !== "active");
-  app.classList.toggle(
-    "onboarding-welcome-shell",
-    state.phase === "welcome" && screen === "welcome",
-  );
-  app.replaceChildren(brand());
+  if (renaming && !state.devices.some((device) => device.id === renaming)) renaming = undefined;
+  if (revoking && !state.devices.some((device) => device.id === revoking)) revoking = undefined;
+  app.className = "";
   const page = state.phase === "active" ? settings() : onboarding();
-  if (state.error) {
-    const errorTarget =
-      state.phase === "active" ? page.querySelector<HTMLElement>(".section") : page;
-    (errorTarget ?? page).prepend(errorMessage(state.error));
-  }
-  app.append(page);
+  if (state.error) page.querySelector("[data-error-target]")?.prepend(errorMessage(state.error));
+  if (context !== lastContext) page.querySelector("[data-error-target]")?.classList.add("rl-enter");
+  app.replaceChildren(page);
   const recoveryField = app.querySelector<HTMLInputElement>(".recovery-field");
   if (recoveryField && recoveryDraft !== undefined) recoveryField.value = recoveryDraft;
-  app.append(
-    el(
-      "footer",
-      "footer",
-      "Relay is an independent project, not affiliated with or endorsed by Helium. Your active tab and window layout stay yours.",
-    ),
-  );
   lastView = statusViewKey(state);
   lastAttention = attentionKey(state);
   lastContext = context;
 }
+
 async function refresh() {
   if (busy || refreshing || document.hidden) return;
   refreshing = true;
@@ -787,6 +1370,7 @@ async function refresh() {
     refreshing = false;
   }
 }
+
 watchStatus(() => {
   if (state) void refresh();
 });
